@@ -66,7 +66,7 @@ namespace FishingAutoCatch
             Console.WriteLine("提示：游戏重启后重新运行本程序即可自动注入。");
         }
 
-        /// <summary>处理 F8 按下沿：翻转 gEnabled + 提示音 + 打印。</summary>
+        /// <summary>处理 F8 按下沿：翻转 gEnabled + 同步 Hook B + 提示音 + 打印。</summary>
         private static void HandleF8Toggle(ref bool injected, ref long lastPid, ref int lastEnabled)
         {
             if (!injected || lastPid == -1)
@@ -100,6 +100,20 @@ namespace FishingAutoCatch
                         Log.Write("F8 切换 → " + txt);
                         Win32Api.Beep(newState == 1 ? 880u : 440u, 100); // 开启 880Hz / 关闭 440Hz，各 100ms
                         lastEnabled = newState;
+
+                        // 关键：Hook B 必须随开关同步（关闭→还原原始 je，恢复原版"等待时间线播完"，
+                        // 否则玩家打第一个音符就会因全音符检查立即判失败）
+                        try
+                        {
+                            long moduleBase = ProcessManager.GetModuleBase(p);
+                            string sync = Injector.SyncHookB(handle.Handle, moduleBase, newState == 1);
+                            Console.WriteLine("  " + sync);
+                            Log.Write(sync);
+                        }
+                        catch (Exception ex2)
+                        {
+                            Log.Write("同步 Hook B 异常: " + ex2.Message);
+                        }
                     }
                 }
             }
@@ -173,6 +187,21 @@ namespace FishingAutoCatch
                             }
                             lastEnabled = state.Value.enabled;
                             lastHits = state.Value.hits;
+
+                            // Hook B 自愈：确保其字节与 gEnabled 一致（防 F8 切换丢失/二进制被外部覆盖）
+                            try
+                            {
+                                string sync = Injector.SyncHookB(handle.Handle, moduleBase, state.Value.enabled == 1);
+                                if (sync.StartsWith("Hook B →"))
+                                {
+                                    Console.WriteLine("  [自愈] " + sync);
+                                    Log.Write("Hook B 自愈: " + sync);
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                Log.Write("Hook B 自愈异常: " + ex.Message);
+                            }
                         }
 
                         // 每约 10 秒自检一次两个 Hook 点是否仍在位

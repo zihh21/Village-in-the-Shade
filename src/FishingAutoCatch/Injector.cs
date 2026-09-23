@@ -154,29 +154,61 @@ namespace FishingAutoCatch
             return buf[0];
         }
 
-        /// <summary>健康检查：两个 Hook 点是否仍在位、开关状态与自动判定累计次数。</summary>
+        /// <summary>健康检查：两个 Hook 点是否在位、Hook B 与开关状态是否一致、开关状态与自动判定累计次数。</summary>
         public static string Verify(IntPtr hProcess, long moduleBase)
         {
-            if (!PatchState.TryLoad(out var m, out var stubBase, out _, out _))
+            if (!PatchState.TryLoad(out var m, out var stubBase, out _, out var originalB))
                 return "状态文件缺失：尚未注入过本模块。";
             if (m != moduleBase)
                 return "模块基址与注入时不符：游戏可能已重启，需重新注入。";
 
             long targetA = moduleBase + HookStub.HookRva;
-            long targetB = moduleBase + HookStub.SuccessRva;
             var curA = new byte[HookStub.PatchLength];
             if (!ReadAt(hProcess, targetA, curA)) return "读取 Hook 点 A 失败。";
             if (!IsOurPatch(curA, stubBase))
                 return "Hook 点 A 字节与记录不符：patch 已被覆盖（需重新注入）。";
-            var curB = new byte[HookStub.SuccessPatchLength];
-            if (!ReadAt(hProcess, targetB, curB)) return "读取 Hook 点 B 失败。";
-            if (!ArraysEqual(curB, HookStub.SuccessPatch))
-                return "Hook 点 B 字节与记录不符：patch 已被覆盖（需重新注入）。";
 
             var st = new byte[5];
             if (!ReadAt(hProcess, stubBase + HookStub.FlagEnabledOffset, st)) return "读取 stub 状态失败。";
+            int enabled = st[0];
             int hits = BitConverter.ToInt32(st, 1);
-            return $"Hook A/B 均在位。开关={st[0]}（1=开），自动判定累计触发 {hits} 次。";
+
+            // Hook B 必须与 gEnabled 一致：开启→NOP（跳过成功检查），关闭→原始 je（等待时间线播完）
+            var curB = new byte[HookStub.SuccessPatchLength];
+            if (!ReadAt(hProcess, moduleBase + HookStub.SuccessRva, curB)) return "读取 Hook 点 B 失败。";
+            bool bWantNop = enabled == 1;
+            bool bMatch = bWantNop ? ArraysEqual(curB, HookStub.SuccessPatch)
+                                   : originalB != null && ArraysEqual(curB, originalB);
+            if (!bMatch)
+                return $"Hook B 与开关状态不一致（当前开关={enabled}）。请用监控窗口按 F8 同步或重新注入。";
+
+            return $"Hook A/B 均在位且与开关一致。开关={enabled}（1=开），自动判定累计触发 {hits} 次。";
+        }
+
+        /// <summary>
+        /// 动态同步 Hook 点 B 字节：开启→写入 NOP（跳过 0x7491b0 成功检查）；
+        /// 关闭→还原原始 `0F 84 81 01 00 00`（恢复"等待时间线播完再判定"的原版行为）。
+        /// 返回结果描述字符串；失败返回以"失败"结尾的说明。
+        /// </summary>
+        public static string SyncHookB(IntPtr hProcess, long moduleBase, bool enabled)
+        {
+            if (!PatchState.TryLoad(out var m, out _, out _, out var originalB))
+                return "状态文件缺失：尚未注入，无需同步。";
+            if (m != moduleBase)
+                return "模块基址与注入时不符（游戏可能已重启），拒绝修改 Hook B。";
+            if (originalB == null || originalB.Length != HookStub.SuccessPatchLength)
+                return "缺少 Hook B 原始字节记录（旧版本状态文件），请重新注入后再切换开关。";
+
+            long targetB = moduleBase + HookStub.SuccessRva;
+            byte[] want = enabled ? HookStub.SuccessPatch : originalB;
+            var cur = new byte[HookStub.SuccessPatchLength];
+            if (ReadAt(hProcess, targetB, cur) && ArraysEqual(cur, want))
+                return enabled ? "Hook B 已处于跳过状态（开启）" : "Hook B 已是原版状态（关闭）";
+            if (!ProtectWriteVerify(hProcess, targetB, want))
+                return "Hook B 写入失败";
+            Win32Api.FlushInstructionCache(hProcess, new IntPtr(targetB), new IntPtr(HookStub.SuccessPatchLength));
+            return enabled ? "Hook B → NOP（跳过成功检查，自动判定生效）"
+                           : "Hook B → 原版 je（恢复等待时间线播完，手动玩法生效）";
         }
 
         /// <summary>供监控模式读取实时开关与命中计数；模块基址与记录不符（游戏重启）时返回 null。</summary>
