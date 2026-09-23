@@ -24,7 +24,7 @@ namespace FishingAutoCatch
         private static readonly byte[] Signature = { 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00 };
 
         // ---------------- 安装 ----------------
-        public static string Install(IntPtr hProcess, long moduleBase)
+        public static string Install(IntPtr hProcess, long pid, long moduleBase)
         {
             long targetA = moduleBase + HookStub.HookRva;
             long targetB = moduleBase + HookStub.SuccessRva;
@@ -32,7 +32,7 @@ namespace FishingAutoCatch
             long targetD = moduleBase + HookStub.BagRva;
 
             // 0) 防重复注入：若是本工具上次打的补丁，先还原为原始字节再重打
-            RestoreIfDoubleInject(hProcess, moduleBase, targetA, targetB, targetC, targetD);
+            RestoreIfDoubleInject(hProcess, pid, moduleBase, targetA, targetB, targetC, targetD);
 
             // 1) 读取四处被覆盖前的原始字节（用于状态文件/还原）
             var originalA = new byte[HookStub.PatchLength];
@@ -83,7 +83,7 @@ namespace FishingAutoCatch
                 return "写入 detour（Hook D）失败或校验不一致。";
 
             // 5) 记录状态并返回
-            PatchState.Save(moduleBase, stubBase, originalA, originalB, originalC, originalD);
+            PatchState.Save(pid, moduleBase, stubBase, originalA, originalB, originalC, originalD);
             return $"注入成功。\n" +
                    $"  Hook A    : 0x{targetA:X}（入口 detour）\n" +
                    $"  Hook B    : 0x{targetB:X}（成功检查跳过）\n" +
@@ -98,10 +98,10 @@ namespace FishingAutoCatch
         /// v1.0.0 曾把 Hook C/D 的 detour 误指向 stubBase（Hook A 区），此处同时识别新（+CastStubOffset/+BagStubOffset）
         /// 与旧（指向 stubBase）两种形态，保证旧补丁也能被还原。
         /// </summary>
-        private static void RestoreIfDoubleInject(IntPtr hProcess, long moduleBase,
+        private static void RestoreIfDoubleInject(IntPtr hProcess, long pid, long moduleBase,
             long targetA, long targetB, long targetC, long targetD)
         {
-            if (!PatchState.TryLoad(out var m, out var stubBase,
+            if (!PatchState.TryLoad(pid, out var m, out var stubBase,
                     out var originalA, out var originalB, out var originalC, out var originalD)) return;
             if (m != moduleBase) return;
 
@@ -127,9 +127,9 @@ namespace FishingAutoCatch
         }
 
         // ---------------- 还原 ----------------
-        public static string Remove(IntPtr hProcess, long moduleBaseNow)
+        public static string Remove(IntPtr hProcess, long pid, long moduleBaseNow)
         {
-            if (!PatchState.TryLoad(out var moduleBase, out var stubBase,
+            if (!PatchState.TryLoad(pid, out var moduleBase, out var stubBase,
                     out var originalA, out var originalB, out var originalC, out var originalD))
                 return "未找到本模块的注入状态文件，无法还原（可能从未注入或文件被删）。";
 
@@ -190,18 +190,18 @@ namespace FishingAutoCatch
 
         // ---------------- 状态读取 / F8 切换 ----------------
         /// <summary>读取游戏内 gEnabled 开关，返回 1=开启 0=关闭，-1=未注入。</summary>
-        public static int ReadEnabledState(IntPtr hProcess)
+        public static int ReadEnabledState(IntPtr hProcess, long pid)
         {
-            if (!PatchState.TryLoad(out _, out var stubBase, out _, out _, out _, out _)) return -1;
+            if (!PatchState.TryLoad(pid, out _, out var stubBase, out _, out _, out _, out _)) return -1;
             var buf = new byte[1];
             if (!ReadAt(hProcess, stubBase + HookStub.FlagEnabledOffset, buf)) return -1;
             return buf[0];
         }
 
         /// <summary>加载器侧 F8 切换：读 gEnabled → 翻转 → 写回。返回新状态（1/0），失败返回 -1。</summary>
-        public static int ToggleEnabled(IntPtr hProcess)
+        public static int ToggleEnabled(IntPtr hProcess, long pid)
         {
-            if (!PatchState.TryLoad(out _, out var stubBase, out _, out _, out _, out _)) return -1;
+            if (!PatchState.TryLoad(pid, out _, out var stubBase, out _, out _, out _, out _)) return -1;
             long addr = stubBase + HookStub.FlagEnabledOffset;
             var buf = new byte[1];
             if (!ReadAt(hProcess, addr, buf)) return -1;
@@ -211,9 +211,9 @@ namespace FishingAutoCatch
         }
 
         /// <summary>健康检查：四个 Hook 点是否在位（含 C/D 指向正确 stub 区）、Hook B 与开关状态是否一致、开关状态与两条计数。</summary>
-        public static string Verify(IntPtr hProcess, long moduleBase)
+        public static string Verify(IntPtr hProcess, long pid, long moduleBase)
         {
-            if (!PatchState.TryLoad(out var m, out var stubBase, out _, out var originalB, out _, out _))
+            if (!PatchState.TryLoad(pid, out var m, out var stubBase, out _, out var originalB, out _, out _))
                 return "状态文件缺失：尚未注入过本模块。";
             if (m != moduleBase)
                 return "模块基址与注入时不符：游戏可能已重启，需重新注入。";
@@ -265,9 +265,9 @@ namespace FishingAutoCatch
         /// 关闭→还原原始 `0F 84 81 01 00 00`（恢复"等待时间线播完再判定"的原版行为）。
         /// 返回结果描述字符串；失败返回以"失败"结尾的说明。
         /// </summary>
-        public static string SyncHookB(IntPtr hProcess, long moduleBase, bool enabled)
+        public static string SyncHookB(IntPtr hProcess, long pid, long moduleBase, bool enabled)
         {
-            if (!PatchState.TryLoad(out var m, out _, out _, out var originalB, out _, out _))
+            if (!PatchState.TryLoad(pid, out var m, out _, out _, out var originalB, out _, out _))
                 return "状态文件缺失：尚未注入，无需同步。";
             if (m != moduleBase)
                 return "模块基址与注入时不符（游戏可能已重启），拒绝修改 Hook B。";
@@ -288,9 +288,9 @@ namespace FishingAutoCatch
 
         /// <summary>供监控模式读取实时开关与计数（含 v1.0.2 入口计数）；模块基址与记录不符（游戏重启）时返回 null。</summary>
         public static (int enabled, int hits, int bagFull, int fishCount,
-                       int entryA, int entryC, int entryD)? ReadLiveState(IntPtr hProcess, long moduleBase)
+                       int entryA, int entryC, int entryD)? ReadLiveState(IntPtr hProcess, long pid, long moduleBase)
         {
-            if (!PatchState.TryLoad(out var m, out var stubBase, out _, out _, out _, out _)) return null;
+            if (!PatchState.TryLoad(pid, out var m, out var stubBase, out _, out _, out _, out _)) return null;
             if (m != moduleBase) return null;
             var st = new byte[22];
             if (!ReadAt(hProcess, stubBase + HookStub.FlagEnabledOffset, st)) return null;

@@ -9,8 +9,8 @@ namespace FishingAutoCatch
     /// <summary>
     /// 自动钓鱼（FishingAutoCatch）启动器 / 注入器。
     /// 用法：
-    ///   FishingAutoCatch                 监控模式（默认）：等待/自动注入游戏、实时显示 F8 开关与自动循环状态、游戏重启自动重注
-    ///   FishingAutoCatch --once          一次性注入（若游戏未启动则等待最多 30 秒）
+    ///   FishingAutoCatch                 监控模式（默认）：等待/自动注入多个游戏实例、实时显示 F8 开关与自动循环状态、实例重启/双开自动重注
+    ///   FishingAutoCatch --once          一次性注入（若游戏未启动则等待最多 30 秒，操作最新启动的实例）
     ///   FishingAutoCatch --status        查询开关状态
     ///   FishingAutoCatch --verify        健康检查（Hook 是否在位 + 触发计数）
     ///   FishingAutoCatch --remove        还原 Hook
@@ -19,7 +19,7 @@ namespace FishingAutoCatch
     internal static class Program
     {
         /// <summary>与 version.txt 同步维护。</summary>
-        public const string Version = "1.0.2";
+        public const string Version = "1.0.3";
 
         private static int Main(string[] args)
         {
@@ -78,7 +78,7 @@ namespace FishingAutoCatch
                 return 0;
             }
 
-            // 默认：监控模式（自动等待游戏启动、自动注入、游戏重启自动重注）
+            // 默认：监控模式（自动等待游戏启动、对全部实例自动注入、实例重启/双开自动重注）
             if (args.Length == 0)
             {
                 Monitor.Run();
@@ -101,26 +101,26 @@ namespace FishingAutoCatch
                     switch (args[0])
                     {
                         case "--remove":
-                            Console.WriteLine(Injector.Remove(handle.Handle, moduleBase));
+                            Console.WriteLine(Injector.Remove(handle.Handle, process.Id, moduleBase));
                             return 0;
 
                         case "--status":
-                            int state = Injector.ReadEnabledState(handle.Handle);
+                            int state = Injector.ReadEnabledState(handle.Handle, process.Id);
                             Console.WriteLine(state == 1 ? "自动钓鱼：开启（保持监控窗口运行，任意场景按 F8 切换，开启 880Hz/关闭 440Hz 提示音）"
                                     : state == 0 ? "自动钓鱼：关闭（保持监控窗口运行，任意场景按 F8 切换）"
                                     : "未注入或状态文件缺失。");
                             return 0;
 
                         case "--verify":
-                            Console.WriteLine(Injector.Verify(handle.Handle, moduleBase));
+                            Console.WriteLine(Injector.Verify(handle.Handle, process.Id, moduleBase));
                             return 0;
 
                         case "--once":
                             Console.WriteLine("正在为目标进程注入自动钓鱼 Hook（四 Hook：节奏判定/成功检查/续竿/背包满）……");
                             Console.WriteLine("  进程     : village.exe (PID " + process.Id + ")");
                             Console.WriteLine("  模块基址 : 0x" + moduleBase.ToString("X"));
-                            Console.WriteLine(Injector.Install(handle.Handle, moduleBase));
-                            Console.WriteLine(Injector.Verify(handle.Handle, moduleBase));
+                            Console.WriteLine(Injector.Install(handle.Handle, process.Id, moduleBase));
+                            Console.WriteLine(Injector.Verify(handle.Handle, process.Id, moduleBase));
                             Log.Write($"一次性注入完成 PID={process.Id}");
                             return 0;
 
@@ -156,8 +156,8 @@ namespace FishingAutoCatch
             Console.WriteLine("背包满自动停下并提示，清包后自动恢复循环；不修改鱼品质/数量。");
             Console.WriteLine();
             Console.WriteLine("用法（不带参数运行 = 监控模式，推荐）：");
-            Console.WriteLine("  FishingAutoCatch             监控模式：等待游戏启动→自动注入→实时显示 F8 开关/已钓条数/背包满→游戏重启自动重注");
-            Console.WriteLine("  FishingAutoCatch --once     一次性注入（等待游戏最多 30 秒）");
+            Console.WriteLine("  FishingAutoCatch             监控模式：等待游戏启动→对所有实例自动注入→实时显示 F8 开关/已钓条数/背包满→实例重启或双开也自动重注");
+            Console.WriteLine("  FishingAutoCatch --once     一次性注入（等待游戏最多 30 秒，操作最新启动的实例）");
             Console.WriteLine("  FishingAutoCatch --status   查询当前开关状态");
             Console.WriteLine("  FishingAutoCatch --verify   健康检查（四个 Hook 是否在位、触发次数、已钓条数）");
             Console.WriteLine("  FishingAutoCatch --remove   还原被 Hook 的原始代码");

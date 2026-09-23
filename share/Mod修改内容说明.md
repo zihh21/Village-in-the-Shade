@@ -4,14 +4,14 @@
 
 ## 当前包含的 Mod
 
-### 1. FishingAutoCatch 自动钓鱼 `v1.0.2`
+### 1. FishingAutoCatch 自动钓鱼 `v1.0.3`
 
 | 项目 | 内容 |
 |---|---|
 | 目录 | `src/FishingAutoCatch/`（C# 加载器，net8.0/x64） |
-| 生效范围 | 全局（任意地点钓鱼均生效） |
+| 生效范围 | 全局（任意地点钓鱼均生效）；**支持多个游戏实例**（重启/双开都会自动注入，v1.0.3） |
 | 热键 | **F8**：开启/关闭自动钓鱼；注入后默认开启。由**监控窗口**轮询全局按键（任意界面、任意场景均可切换）；切换时加载器侧发出提示音（开启 880Hz、关闭 440Hz，各 100ms） |
-| 用法 | 运行 `Mods/FishingAutoCatch/FishingAutoCatch.exe`（推荐不带参数进入**监控模式**：自动等待游戏启动后注入、游戏重启后自动重新注入、实时显示自动模式/已钓条数/背包满状态，按任意键退出监控）；另支持 `--once`（一次性注入）、`--status`（查状态）、`--verify`（健康检查+触发计数）、`--remove`（还原）、`--dump-stub`（调试） |
+| 用法 | 运行 `Mods/FishingAutoCatch/FishingAutoCatch.exe`（推荐不带参数进入**监控模式**：自动等待游戏启动后对**所有** village.exe 实例注入、实例重启或双开后新实例也会自动注入、实时显示每个实例的自动模式/已钓条数/背包满状态，按任意键退出监控）；另支持 `--once`（一次性注入，操作最新启动的实例）、`--status`（查状态）、`--verify`（健康检查+触发计数）、`--remove`（还原）、`--dump-stub`（调试） |
 | 补充 | 每次运行写入 `FishingAutoCatch.log`（exe 同目录），窗口常驻不会一闪而过；F8 开关依赖监控窗口运行（游戏重启后重开本程序即可） |
 
 **功能**：
@@ -53,15 +53,46 @@
     rip 相对 + rel32），返回后检查 al 维护 gBagFull/gFishCount；只用易失寄存器，r13 保留供 resume。
 - 热键检测与提示音全部在加载器进程（stub 不调用任何外部 API）；注入已注入进程时先还原旧补丁再重打；
   `--remove` 先校验当前字节为自身 patch 再还原并写日志。
-- Mod 结构：`Program.cs`（入口/CLI）、`Monitor.cs`（监控模式：自动注入/重启重注/实时状态/F8 轮询/背包满提示）、
+- Mod 结构：`Program.cs`（入口/CLI）、`Monitor.cs`（监控主循环：多实例跟踪表 + F8 轮询 + 退出按键）、
+  `InstanceMonitor.cs`（v1.0.3 新增：多实例注入/轮询/入口计数/十秒自检、F8 全实例统一翻转）、
   `Injector.cs`（分配内存/四补丁安装/还原/校验/F8 切换）、`HookStub.cs`（Hook A 机器码+stub 布局编排）、
-  `CastHookStub.cs`（Hook C/D 机器码生成）、`ProcessManager.cs`（定位进程）、`PatchState.cs`（注入状态持久化，含四补丁原始字节）、
+  `CastHookStub.cs`（Hook C/D 机器码生成）、`ProcessManager.cs`（定位进程，v1.0.3 支持枚举全部实例）、
+  `PatchState.cs`（注入状态持久化，v1.0.3 起**按进程 PID 分文件** `FishingAutoCatch.state.<pid>`，含四补丁原始字节）、
   `Win32Api.cs`（P/Invoke）、`Log.cs`（日志）。
 - 辅助脚本：`scripts/dump_hook_bytes.py`（按 RVA dump village.exe 覆盖段原始字节）、
   `scripts/verify_stub_v100.py`（stub 结构校验，已随 v1.0.2 更新：验证三口入口计数 `FF 05` 与复放段新偏移）、
   `scripts/probe_v102.ps1`（实机内存探针：OpenProcess+ReadProcessMemory 读取四 Hook 与 stub 字节）。
 
 ## 更新记录
+
+### 2026-09-24（v1.0.3：修复"重启/双开游戏后 Mod 完全不生效"——监控模式支持多实例，根因定位）
+
+- **背景**：v1.0.2 入口计数上线后实测，三个 Hook 入口计数 **A=0 C=0 D=0**——游戏从未执行到任何 Hook 点；
+  进一步枚举发现系统里同时存在**两个 village.exe**（旧实例 PID 24924 于 00:27 启动、新实例 PID 17560 于
+  01:50:47 启动），实机探针确认：旧实例四 Hook detour 在位（v1.0.2 已注入），**新实例四个 Hook 点全部是
+  原始字节（从未被注入）**——用户在 01:50:47 之后启动的新实例里钓鱼，Mod 完全无效；而 F8 开关一直在
+  切换旧实例的 gEnabled，与用户游玩的实例毫无关联。这正是"开启后仍无任何效果、入口计数全 0"的根因。
+- **根因**：旧版 `ProcessManager.FindVillageProcess()` 用 `Process.GetProcessesByName("village")` 返回
+  **列表中的第一个实例**；监控进程注入后只绑定最早发现的实例，后续启动的新实例永远不会被注入。
+  叠加游戏 PE **关闭 ASLR**（多个实例 moduleBase 完全相同，本会话均为 0x7FF66AA00000），
+  `PatchState` 单文件（只用 moduleBase 标识）在多实例下互相覆盖，进一步加剧"只管理一个实例"。
+- **修复（监控多实例）**：
+  1. `ProcessManager` 新增 `FindAllVillageProcesses()`（枚举全部可访问实例，按启动时间排序）；
+     `FindVillageProcess()` 改为返回**最新启动**的实例（`--once/--status/--verify/--remove` 操作正在玩的实例）。
+  2. 新增 `InstanceMonitor.cs`：监控维护 `Dictionary<pid, InstanceState>` 实例跟踪表——
+     新实例出现即自动注入（注入+回读+Verify），已注入实例逐个轮询（开关/命中/已钓/背包满/入口计数、
+     Hook B 自愈、约 10 秒自检），实例退出自动移除跟踪（等待其重启后再次注入）。
+  3. `PatchState` 改为按 PID 分文件 `FishingAutoCatch.state.<pid>`：多实例各自记录 stub 基址与四补丁
+     原始字节互不干扰；兼容回退读取旧单文件 `FishingAutoCatch.state`，旧版本注入过的实例可被识别/还原。
+  4. F8 切换改为对**所有已注入实例**统一翻转 gEnabled + 同步 Hook B（提示音仍单次）。
+- **验证**：`dotnet build -c Release` 0 警告 0 错误；`--dump-stub` → capstone 校验**通过**（v1.0.3 未动 stub，
+  与 v1.0.2 一致）；部署至 `Mods/FishingAutoCatch/` 后启动新监控，日志确认 **02:10:13 同时注入
+  PID=24924 与 PID=17560**：两个实例 Hook A/B/C/D detour 全部在位、Hook B=NOP（默认开启）、
+  state 文件 `FishingAutoCatch.state.24924` / `FishingAutoCatch.state.17560` 正确分文件；实机探针复核通过。
+- **遗留说明**：旧实例 24924 的旧 `FishingAutoCatch.state` 单文件保留作为兼容（新实例写入后不再使用）。
+- **待用户确认**：保持监控窗口运行、F8 开启（默认开启）在**当前游玩的实例**（已全部注入）里正常钓鱼一次，
+  观察 ① 监控窗口是否出现"入口 A 已执行 N 次"（咬钩进入节奏小游戏）与"自动判定已触发 N 次"（判定生效），
+  ② 收竿后是否自动重甩（入口 C 增长）、入包是否计数（入口 D 增长）。
 
 ### 2026-09-24（v1.0.2：用户反馈"开启后仍无效"——新增入口计数与关键步骤日志，客观定位根因）
 
