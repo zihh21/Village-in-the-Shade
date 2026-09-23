@@ -88,13 +88,34 @@ namespace FishingAutoCatch
         /// <summary>全局单例（内容为持有物/关系容器，+0x208 持有物容器、+0x208+0x32B8 背包容器）。</summary>
         public const long GlobalRva = 0x10DFAD0L;
 
+        // ---------------- Hook 点 E：自动拉线（v1.0.4 新增） ----------------
+        /// <summary>
+        /// Hook 点 E：state2（0x215AAE 等咬钩状态）中"0x498 拉线键判定"处，覆盖 0x215D2B..0x215D3A 共 16 字节，
+        /// resume 0x215D3B（`cmp qword [r14+0x238],0`，原版按下 0x498 后继续）。
+        ///   0x215D2B test sil,sil（3B，40 84 F6）
+        ///   0x215D2E je 0x215d4d（2B，74 1D；未按 0x498 走超时等待路径）
+        ///   0x215D30 mov dword [r14+0x1DC],3（11B，41 C7 86 DC 01 00 00 03 00 00 00；按下 → 进 state3 拉线判定）
+        /// 反编译结论：原版"鱼咬钩后拉线"＝玩家按 0x498 → state3 创建节奏任务 → （Hook A 秒判）→ 结算入包。
+        /// 挂机时无人按键 → 永远不创建任务 → Hook A/C/D 全部无击发（用户实测"手动拉线才入包"的根因）。
+        /// 自动模式：gEnabled=1 且 gBagFull=0 时无条件写 [1DC]=3（等效自动按 0x498）；否则原版复放（F8 关 / 背包满等玩家手动）。
+        /// 覆盖区跳入点（0x215CD8 jne / 0x215CE1 je / 0x215D04 jmp / 0x215D14 jae）全部落在覆盖区起点 = detour 入口，安全。
+        /// state3 内任务创建依赖浮标时间轴播完（0x215E54 je 0x215f70），提前拉线只会原地等待，不会卡死或凭空出鱼。
+        /// </summary>
+        public const long HookERva = 0x215D2BL;
+        public const int HookEPatchLength = 16;
+        public const long HookEResumeRva = 0x215D3BL;
+        /// <summary>原版路径中"未按 0x498"的跳转目标（跳过写 [1DC]=3，直接走浮标状态/超时等待）。</summary>
+        public const long HookENotPressedRva = 0x215D4DL;
+
         // ---------------- 注入缓冲区布局（代码区 + 查询结构区 + 状态字节） ----------------
         /// <summary>续竿 stub 起点（Hook A 区结束后向 16 对齐）。</summary>
         public const int CastStubOffset = 176;
         /// <summary>入包 stub 起点（续竿 stub 结束后向 16 对齐，预留 192 字节空间）。</summary>
         public const int BagStubOffset = 368;
-        /// <summary>状态区起点：gEnabled(1B) + gHits(4B) + gBagFull(1B) + gFishCount(4B) + 三口入口计数(4B×3)。</summary>
-        public const int FlagsOffset = 560;
+        /// <summary>自动拉线 stub 起点（v1.0.4：入包 stub 结束后向 16 对齐，预留 112 字节空间）。</summary>
+        public const int HookEStubOffset = 560;
+        /// <summary>状态区起点：gEnabled(1B) + gHits(4B) + gBagFull(1B) + gFishCount(4B) + 四口入口计数(4B×4)。</summary>
+        public const int FlagsOffset = 672;
         /// <summary>gEnabled：自动模式总开关（F8）。</summary>
         public const int FlagEnabledOffset = FlagsOffset + 0;
         /// <summary>gHits(dword)：自动判定累计触发次数（诊断）。</summary>
@@ -109,12 +130,14 @@ namespace FishingAutoCatch
         public const int FlagEntryCOffset = FlagsOffset + 14;
         /// <summary>gEntryD(dword)：Hook D（0x216B46）入口被执行次数（无条件计数，v1.0.2 诊断用）。</summary>
         public const int FlagEntryDOffset = FlagsOffset + 18;
-        /// <summary>总缓冲区：Hook A(≤176) + Hook C(≤192) + Hook D(≤192) + Flags(22)。</summary>
-        public const int StubBufferSize = 640;
+        /// <summary>gEntryE(dword)：Hook E（0x215D2B）入口被执行次数（无条件计数，v1.0.4 诊断用）。</summary>
+        public const int FlagEntryEOffset = FlagsOffset + 22;
+        /// <summary>总缓冲区：Hook A(≤176) + Hook C(≤192) + Hook D(≤192) + Hook E(≤112) + Flags(26)。</summary>
+        public const int StubBufferSize = 704;
 
         /// <summary>
         /// 生成完整 stub 缓冲区（跳转与 64 位立即数已回填）。
-        /// 布局：[0,176)  Hook A 节奏判定 → [176,368) Hook C 续竿/重甩 → [368,560) Hook D 入包/背包满 → [560,640) 状态区。
+        /// 布局：[0,176) A 节奏判定 → [176,368) C 续竿/重甩 → [368,560) D 入包/背包满 → [560,672) E 自动拉线 → [672,704) 状态区。
         /// 状态区固定偏移由注入器初始化（gEnabled/gHits/gBagFull/gFishCount）。
         /// </summary>
         /// <param name="stubBase">注入缓冲区在目标进程内的基址。</param>
@@ -131,6 +154,7 @@ namespace FishingAutoCatch
             BuildHookA(buf, moduleBase, flagEnabled, flagHits);
             CastHookStub.BuildCast(buf, CastStubOffset, moduleBase, flagEnabled, flagBagFull);
             CastHookStub.BuildBag(buf, BagStubOffset, moduleBase, flagEnabled, flagBagFull, flagFishCount);
+            CastHookStub.BuildHookE(buf, HookEStubOffset, moduleBase, flagEnabled, flagBagFull);
             return buf;
         }
 

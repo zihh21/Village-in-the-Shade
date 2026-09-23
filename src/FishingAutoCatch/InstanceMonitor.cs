@@ -14,14 +14,16 @@ namespace FishingAutoCatch
         public long ModuleBase;
         public bool Injected;
         public int LastEnabled = -1, LastHits = -1, LastFishCount = -1, LastBagFull = -1;
-        public int LastEntryA = -1, LastEntryC = -1, LastEntryD = -1;
-        /// <summary>自检节拍（约每 10 秒 Verify 一次四个 Hook 是否仍在位）。</summary>
+        public int LastEntryA = -1, LastEntryC = -1, LastEntryD = -1, LastEntryE = -1;
+        /// <summary>自检节拍（约每 10 秒 Verify 一次五个 Hook 是否仍在位）。</summary>
         public int SelfTick;
+        /// <summary>上次自动重注入时刻（Environment.TickCount），防 Verify 失败死循环重注。</summary>
+        public int LastReinjectAt;
 
         public void ResetLast()
         {
             LastEnabled = -1; LastHits = -1; LastFishCount = -1; LastBagFull = -1;
-            LastEntryA = -1; LastEntryC = -1; LastEntryD = -1; SelfTick = 0;
+            LastEntryA = -1; LastEntryC = -1; LastEntryD = -1; LastEntryE = -1; SelfTick = 0;
         }
     }
 
@@ -86,7 +88,7 @@ namespace FishingAutoCatch
             }
         }
 
-        /// <summary>对某个新发现的游戏实例：注入 + 回读四个 Hook 点真实字节 + Verify 校验。</summary>
+        /// <summary>对某个新发现的游戏实例：注入 + 回读五个 Hook 点真实字节 + Verify 校验。</summary>
         private static void InjectInstance(Process p, InstanceState st)
         {
             using (var handle = new SafeProcessHandle(p))
@@ -109,7 +111,7 @@ namespace FishingAutoCatch
             }
         }
 
-        /// <summary>轮询某实例实时状态（开关/命中/已钓/背包满/三口入口计数）+ Hook B 自愈 + 十日 Verify。</summary>
+        /// <summary>轮询某实例实时状态（开关/命中/已钓/背包满/四口入口计数）+ Hook B 自愈 + 十日 Verify。</summary>
         private static void PollInstance(Process p, InstanceState st)
         {
             using (var handle = new SafeProcessHandle(p))
@@ -164,6 +166,11 @@ namespace FishingAutoCatch
                     Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] PID={st.Pid} 入口 D（0x216B46 入包/背包满）已执行 {v.entryD} 次");
                     Log.Write($"入口 D 已执行 PID={st.Pid} {v.entryD} 次");
                 }
+                if (v.entryE != st.LastEntryE && st.LastEntryE != -1 && v.entryE > 0)
+                {
+                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] PID={st.Pid} 入口 E（0x215D2B state2 自动拉线）已执行 {v.entryE} 次");
+                    Log.Write($"入口 E 已执行 PID={st.Pid} {v.entryE} 次");
+                }
 
                 st.LastEnabled = v.enabled;
                 st.LastHits = v.hits;
@@ -172,6 +179,7 @@ namespace FishingAutoCatch
                 st.LastEntryA = v.entryA;
                 st.LastEntryC = v.entryC;
                 st.LastEntryD = v.entryD;
+                st.LastEntryE = v.entryE;
 
                 // Hook B 自愈：确保其字节与 gEnabled 一致（防 F8 切换丢失/二进制被外部覆盖）
                 try
@@ -188,14 +196,24 @@ namespace FishingAutoCatch
                     Log.Write($"Hook B 自愈异常 PID={st.Pid}: " + ex.Message);
                 }
 
-                // 每约 10 秒自检一次四个 Hook 点是否仍在位
+                // 每约 10 秒自检一次五个 Hook 点是否仍在位；失败（旧版本注入缺 Hook E / 字节被外部覆盖）则自动重新注入
                 if (++st.SelfTick % 20 == 0)
                 {
                     string check = Injector.Verify(handle.Handle, st.Pid, st.ModuleBase);
-                    if (!check.StartsWith("Hook A/B/C/D 均在位"))
+                    if (!check.StartsWith("Hook A/B/C/D/E 均在位"))
                     {
                         Console.WriteLine($"[监控 PID={st.Pid}] " + check);
                         Log.Write($"自检 PID={st.Pid}: " + check);
+                        // 升级兼容（v1.0.3 → v1.0.4）：旧实例是被 v1.0.3 注入的，缺 Hook E；
+                        // 也覆盖 Hook 字节被外部工具覆盖的情形。重新注入前 Install 内部会先还原本模块旧补丁。
+                        // 防死循环：自检周期约 10 秒，距上次重注入不足 15 秒则跳过本次。
+                        if (Environment.TickCount - st.LastReinjectAt > 15000)
+                        {
+                            Console.WriteLine($"[监控 PID={st.Pid}] Verify 未通过，自动重新注入补齐 Hook……");
+                            Log.Write($"自动重新注入 PID={st.Pid}");
+                            st.LastReinjectAt = Environment.TickCount;
+                            InjectInstance(p, st);
+                        }
                     }
                 }
             }

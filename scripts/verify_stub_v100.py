@@ -1,41 +1,51 @@
 # -*- coding: utf-8 -*-
-"""FishingAutoCatch v1.0.2 stub 结构校验（对齐指令边界 + 绝对地址槽）。
-
-v1.0.2 变更：Hook A/C/D 三个 stub 入口各增加 6 字节无条件入口计数
-（`FF 05 disp32` → inc dword[rip+disp32]），因此：
-  - Hook C 区 movsd 复放段由偏移 176 后移至 182；
-  - Hook D 区复放段（stub 偏移 13 起）后移 6 字节。
+"""FishingAutoCatch v1.0.4 stub 机器码逐指令校验（对齐指令边界 + 绝对地址槽）。
+v1.0.4 变更：
+  - 新增 Hook E（state2 自动拉线 stub），缓冲区布局重排为
+    A[0,176) / C[176,368) / D[368,560) / E[560,672) / 状态区[672,704)，StubBufferSize=704。
+    入口计数四口：gEntryA@682 gEntryC@686 gEntryD@690 gEntryE@694；
+    状态 gEnabled@672 gHits@673 gBagFull@677 gFishCount@678。
+  - Hook E 语义：自动模式（gEnabled=1 且 gBagFull=0）→ 写 [r14+0x1DC]=3 后 jmp resume 0x140215D3B；
+    F8 关/背包满 → 复放原版 test sil,sil；未按 0x498 → jmp 0x140215D4D。
 
 关键校验：
-  1. Hook C 复放 movsd 两条与原始字节完全一致。
-  2. 所有 jmp qword[rip+0] 槽后的 8 字节 = 期望 resume/module 地址。
-  3. stub 内未使用 rbx/r13/r14（非易失寄存器）作为写入目标（r14 读基址除外，保留）。
-  4. rel8 跳转目标落在指令标签处。
-  5. 三个入口的 `FF 05` 入口计数指令存在（偏移 0 / 176 / 368）。
+  1. 每个 `jmp qword ptr [rip+0]` 槽后 8 字节 = 期望 resume/module 地址；
+  2. stub 内不得把非易失寄存器（rbx/rbp/r12-r15/rsp）作为写入目标；
+  3. rel8 跳转目标落在指令标签处；
+  4. 四个 `FF 05` 入口计数指令存在（偏移 0 / 176 / 368 / 560）。
 """
 import struct
+import sys
 from capstone import Cs, CS_ARCH_X86, CS_MODE_64
 
-PATH = r"E:\BaiduNetdiskDownload\Village in the Shade\src\FishingAutoCatch\stub_dump.bin"
-data = open(PATH, "rb").read()
-md = Cs(CS_ARCH_X86, CS_MODE_64)
+STUB_BASE = 0x140100000          # --dump-stub 假基址（与 C# DumpStubBytes 一致）
+MODULE_BASE = 0x140000000
 
-# 期望的绝对地址（dump 默认 stubBase=0x140100000, moduleBase=0x140000000）
-STUB_BASE = 0x140100000
+# 期望的绝对地址
 EXPECT = {
-    "hookA_resume": 0x140000000 + 0x38A860 + 15,
+    "hookA_resume": 0x140000000 + 0x38A860 + 15,   # 0x14038A86F
     "cast_resume": 0x140000000 + 0x216CB6,
     "bag_resume": 0x140000000 + 0x216B73,
-    "global": 0x140000000 + 0x10DFAD0,
+    "hookE_resume": 0x140000000 + 0x215D3B,
+    "hookE_notPressed": 0x140000000 + 0x215D4D,
     "addHold": 0x140000000 + 0x138BC0,
-    "gEnabled": STUB_BASE + 560,
-    "gHits": STUB_BASE + 561,
-    "gBagFull": STUB_BASE + 565,
-    "gFishCount": STUB_BASE + 566,
-    "gEntryA": STUB_BASE + 570,
-    "gEntryC": STUB_BASE + 574,
-    "gEntryD": STUB_BASE + 578,
+    "global": 0x140000000 + 0x10DFAD0,
+    "gEnabled": STUB_BASE + 672,
+    "gHits": STUB_BASE + 673,
+    "gBagFull": STUB_BASE + 677,
+    "gFishCount": STUB_BASE + 678,
+    "gEntryA": STUB_BASE + 682,
+    "gEntryC": STUB_BASE + 686,
+    "gEntryD": STUB_BASE + 690,
+    "gEntryE": STUB_BASE + 694,
 }
+
+STUBS = [
+    (0, 176, "Hook A 节奏判定", "hookA_resume"),
+    (176, 368, "Hook C 续竿/重甩", "cast_resume"),
+    (368, 560, "Hook D 入包/背包满", "bag_resume"),
+    (560, 672, "Hook E 自动拉线", "hookE_resume"),
+]
 
 FAILS = []
 
@@ -44,73 +54,127 @@ def chk(cond, msg):
         FAILS.append(msg)
         print("  [FAIL] " + msg)
 
-def read_abs(base, addr):
-    return struct.unpack_from("<Q", data, addr)[0]
+def main():
+    path = sys.argv[1] if len(sys.argv) > 1 else r"E:\BaiduNetdiskDownload\Village in the Shade\src\FishingAutoCatch\stub_dump.bin"
+    data = open(path, "rb").read()
+    md = Cs(CS_ARCH_X86, CS_MODE_64)
+    print(f"stub 总长 {len(data)} 字节（预期 704）")
 
-# ---------- Hook A [0,176) ----------
-print("==== Hook A ====")
-ins = list(md.disasm(data[0:176], 0))
-last = ins[-1]
-print(f"  末尾指令: 0x{last.address:03X} {last.mnemonic} {last.op_str}")
-# 定位 jmp qword[rip+0] 指令，其 8 字节槽应跟在其后 6 字节处
-for it in ins:
-    if it.mnemonic == "jmp" and it.op_str == "qword ptr [rip]":
-        slot = read_abs(0, it.address + 6)
-        print(f"  jmp 槽@0x{it.address:03X} = 0x{slot:X}")
-        chk(slot == EXPECT["hookA_resume"], f"Hook A resume 槽错误: 0x{slot:X} 期望 0x{EXPECT['hookA_resume']:X}")
+    # 状态区初始值（注入器写入前应为全 0）
+    print("状态区[672:704]（预期全 0）:", data[672:704].hex(" "))
+    chk(all(b == 0 for b in data[672:704]), "状态区初始非全 0")
 
-# ---------- Hook C [176,368) ----------
-print("==== Hook C ====")
-# v1.0.2：偏移 176 起是 6 字节入口计数 inc dword[rip+disp32]（FF 05），movsd 复放段后移至 182
-chk(data[176:178] == bytes.fromhex("FF 05"), "Hook C 缺少 v1.0.2 入口计数指令 FF 05")
-# 被覆盖原始字节（26 字节）：前 15B 是 movsd×2 必须复放一致；后 11B 是 mov dword[1DC],1
-# 由我们的写 0/写 1 判定逻辑替换，不复放。
-CAST_REPLAY = bytes.fromhex("F2 0F 10 44 24 50  F2 41 0F 11 86 A8 02 00 00")
-chk(data[182:182+15] == CAST_REPLAY, f"Hook C movsd 复放与原字节不一致")
-print(f"  movsd 复放: {'一致' if data[182:182+15] == CAST_REPLAY else '不一致'}")
-ins = list(md.disasm(data[182:182+26], 182))
-for it in ins:
-    print(f"  0x{it.address:03X}: {it.mnemonic}\t{it.op_str}")
-# 检查 stub 生成区（182+26 起）：寻找 je/jne/jmp 并核对槽
-stubC = data[182+26:368]
-insC = list(md.disasm(stubC, 182+26))
-for it in insC:
-    if it.mnemonic == "jmp" and it.op_str == "qword ptr [rip]":
-        slot = read_abs(0, it.address + 6)
-        print(f"  jmp 槽@0x{it.address:03X} = 0x{slot:X}")
-        chk(slot == EXPECT["cast_resume"], f"Hook C resume 槽错误: 0x{slot:X}")
-    if it.mnemonic in ("movabs",) and it.op_str.startswith("r11, 0x"):
-        pass
+    for start, end, label, resume_key in STUBS:
+        seg = data[start:end]
+        print(f"\n==== {label} [{start},{end}) ====")
+        chk(seg[0:2] == bytes.fromhex("FF 05"), f"{label} 缺少入口计数 FF 05（偏移 {start}）")
 
-# ---------- Hook D [368,560) ----------
-print("==== Hook D ====")
-# v1.0.2：偏移 368 起是 6 字节入口计数 inc dword[rip+disp32]（FF 05）
-chk(data[368:370] == bytes.fromhex("FF 05"), "Hook D 缺少 v1.0.2 入口计数指令 FF 05")
-code = data[368:368+45]
-print("  stub 前 45 字节:", code.hex(" "))
-# 原 0x216B4D 起（mov rcx,[rax+0x208] 到 call 前）共 33 字节应与 stub 中复放段逐字节一致
-BAG_REPLAY = bytes.fromhex(
-    "48 8B 88 08 02 00 00"   # mov rcx,[rax+0x208]
-    "C6 44 24 20 01"         # mov byte [rsp+0x20],1
-    "45 33 C9"               # xor r9d,r9d
-    "BA 1A 04 00 00"         # mov edx,0x41a
-    "41 B8 06 00 00 00"      # mov r8d,6
-    "48 8B 89 B8 32 00 00")  # mov rcx,[rcx+0x32b8]
-# 入口计数 6B + movabs(10B) + mov rax,[r11](3B) = 复放段从 stub 偏移 19 起共 33 字节，
-# 因 movabs(10B) 比原 mov rax,[rip](7B) 长 3B？—— 实际复放段从 368+6+10+3=387 起，用完整缓冲区比较。
-replay = data[368 + 6 + 13:368 + 6 + 13 + 33]
-print(f"  复放段（mov rcx 起 33B）: {'一致' if replay == BAG_REPLAY else '不一致'}")
-chk(replay == BAG_REPLAY, "Hook D 复放段与原始不一致")
-insD = list(md.disasm(code, 368))
-for it in insD:
-    print(f"  0x{it.address:03X}: {it.mnemonic}\t{it.op_str}")
+        # 手工游标反汇编：遇 jmp qword[rip+0]，读取其后 8 字节槽并跳过
+        # （避免把绝对地址槽当作指令反汇编产生噪音）
+        nz = len(seg)
+        while nz > 0 and seg[nz-1] == 0:
+            nz -= 1
+        addr = start
+        ncode = 0
+        while addr < start + nz:
+            ins = next(md.disasm(seg[addr-start:nz], STUB_BASE + addr), None)
+            if ins is None:
+                print(f"  0x{STUB_BASE+addr:X}: !! 无法反汇编（剩余 {start+nz-addr} 字节）")
+                chk(False, f"{label} 0x{STUB_BASE+addr:X} 反汇编失败")
+                break
+            tgt_note = ""
+            if ins.mnemonic == "jmp" and "qword ptr [rip" in ins.op_str:
+                # 槽在 6 字节 jmp 之后
+                slot_off = addr + ins.size
+                slot = struct.unpack_from("<Q", seg, slot_off - start)[0] if slot_off + 8 <= end else 0
+                tgt_note = f"  → 0x{slot:X}"
+                valid = [EXPECT[resume_key]]
+                if resume_key == "hookE_resume":
+                    valid.append(EXPECT["hookE_notPressed"])  # 未按 0x498 → 0x215D4D 汇合点
+                chk(slot in valid, f"{label} jmp 槽@0x{STUB_BASE+addr:X} = 0x{slot:X} 期望 0x{EXPECT[resume_key]:X}")
+                print(f"  0x{STUB_BASE+addr:X}: {ins.mnemonic}\t{ins.op_str}{tgt_note}")
+                addr = slot_off + 8
+                ncode += 1
+                continue
+            print(f"  0x{STUB_BASE+addr:X}: {ins.mnemonic}\t{ins.op_str}")
+            addr += ins.size
+            ncode += 1
+        print(f"  指令数（含 jmp 槽跳读）: {ncode}")
 
-print("\n==== 全部 stub 的人工审阅：跳转/槽/寄存器约束 ====")
-for it in list(md.disasm(data[176:560], 176)):
-    # 打印所有带立即数字段的指令供人工复核
-    if it.mnemonic in ("movabs", "cmp", "mov", "jmp", "je", "jne", "inc", "call", "test", "xor"):
-        print(f"  0x{it.address:03X}: {it.mnemonic}\t{it.op_str}")
+    # ---------- Hook E 专项语义 ----------
+    print("\n==== Hook E 专项语义（0x140215D2B 覆盖段 16B 复放语义） ====")
+    segE = data[560:672]
+    nz = len(segE)
+    while nz > 0 and segE[nz-1] == 0:
+        nz -= 1
+    codeE = segE[:nz]
+    # 自动模式路径：写 [r14+0x1DC]=3 → jmp 0x140215D3B
+    # 原版复放：40 84 F6（test sil,sil）+ 74 xx（je notPressed）+ 写 3 + jmp resume
+    found_write = 0
+    find_test = False
+    find_notpressed = False
+    md2 = Cs(CS_ARCH_X86, CS_MODE_64)
+    i = 0
+    while i < len(codeE):
+        ins = next(md2.disasm(codeE[i:], STUB_BASE + 560 + i), None)
+        if ins is None:
+            break
+        if ins.mnemonic == "mov" and "dword ptr [r14 + 0x1dc], 3" in ins.op_str:
+            found_write += 1
+            # 其后应为 jmp qword[rip]
+            nxt = next(md2.disasm(codeE[i+ins.size:], STUB_BASE + 560 + i + ins.size), None)
+            if nxt and nxt.mnemonic == "jmp" and "qword ptr [rip" in nxt.op_str:
+                slot = struct.unpack_from("<Q", codeE, i + ins.size + nxt.size)[0]
+                chk(slot == EXPECT["hookE_resume"],
+                    f"Hook E 自动写 [1DC]=3 后的 jmp 槽 = 0x{slot:X} 期望 0x{EXPECT['hookE_resume']:X}")
+                print(f"  自动路径 0x{STUB_BASE+560+i:X}: mov [r14+0x1DC],3 → jmp 0x{slot:X}")
+            i += ins.size + nxt.size if nxt else ins.size
+            continue
+        if ins.mnemonic == "test" and ins.op_str == "sil, sil":
+            find_test = True
+            print(f"  原版复放 0x{STUB_BASE+560+i:X}: test sil, sil（与原版 0x215D2B 一致）")
+        if ins.mnemonic == "jmp" and "qword ptr [rip" in ins.op_str and i > 0:
+            slot_bytes = codeE[i + ins.size:i + ins.size + 8]
+            slot = struct.unpack_from("<Q", slot_bytes + b"\x00" * (8 - len(slot_bytes)))[0]
+            if slot == EXPECT["hookE_notPressed"]:
+                find_notpressed = True
+                print(f"  未按路径 0x{STUB_BASE+560+i:X}: jmp → 0x{slot:X}（原版 je 0x215d4d 汇合点）")
+        i += ins.size
+    chk(found_write == 2, f"Hook E 写 [r14+0x1DC]=3 应 2 次（自动+复放），实际 {found_write} 次")
+    chk(find_test, "Hook E 缺少原版复放 test sil,sil")
+    chk(find_notpressed, "Hook E 缺少未按 0x498 → 0x215D4D 的跳转")
 
-print("\n结论:", "通过" if not FAILS else f"存在 {len(FAILS)} 处错误")
-for f in FAILS:
-    print("  -", f)
+    print("\n==== 非易失寄存器写检测 ====")
+    md2 = Cs(CS_ARCH_X86, CS_MODE_64)
+    CALLER_SO = ("rbx", "rbp", "r12", "r13", "r14", "r15", "rsp",
+                 "ebx", "ebp", "r12d", "r13d", "r14d", "r15d", "esp")
+    for start, end, label, _ in STUBS:
+        seg = data[start:end]
+        nz = len(seg)
+        while nz > 0 and seg[nz-1] == 0:
+            nz -= 1
+        addr = start
+        while addr < start + nz:
+            ins = next(md2.disasm(seg[addr-start:nz], STUB_BASE + addr), None)
+            if ins is None:
+                break
+            # 写目标操作数检查（仅看第一个操作数，写类指令）
+            if ins.mnemonic.startswith(("mov", "lea", "pop", "inc", "dec", "add", "sub",
+                                        "xor", "and", "or", "imul", "neg", "not", "shl", "shr")):
+                op0 = ins.op_str.split(",")[0]
+                if op0 in CALLER_SO:
+                    print(f"  [FAIL] {label} 0x{STUB_BASE+addr:X}: {ins.mnemonic} {ins.op_str} 写非易失 {op0}")
+                    FAILS.append(f"{label} 0x{STUB_BASE+addr:X} 写非易失寄存器 {op0}")
+            if ins.mnemonic == "jmp" and "qword ptr [rip" in ins.op_str:
+                addr += ins.size + 8     # 跳过 jmp 槽
+            else:
+                addr += ins.size
+    print("  非易失写入检测完成")
+
+    print(f"\n结论: {'全部通过 OK' if not FAILS else f'{len(FAILS)} 处失败 FAIL'}")
+    for f in FAILS:
+        print("  -", f)
+    return 0 if not FAILS else 1
+
+if __name__ == "__main__":
+    sys.exit(main())

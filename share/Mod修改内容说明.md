@@ -4,7 +4,7 @@
 
 ## 当前包含的 Mod
 
-### 1. FishingAutoCatch 自动钓鱼 `v1.0.3`
+### 1. FishingAutoCatch 自动钓鱼 `v1.0.4`
 
 | 项目 | 内容 |
 |---|---|
@@ -16,8 +16,9 @@
 
 **功能**：
 
-- **自动循环**：F8 开启后，水边甩竿即进入自动钓鱼循环——等咬钩 → 自动判定（跳过节奏小游戏）→
-  收竿入包 → 自动再甩竿（刷新浮标位置）。全程无需按键，直到玩家手动停止或背包满。
+- **自动循环（全自动链 v1.0.4）**：F8 开启后，水边甩竿即进入自动钓鱼循环——等咬钩 → **自动拉线
+  （v1.0.4 新增，等效自动按咬钩确认键 0x498）** → 自动判定（跳过节奏小游戏）→ 收竿入包 →
+  自动再甩竿（刷新浮标位置）。全程无需按键，直到玩家手动停止或背包满。
 - **手动停止**：按游戏内收杆键（Enter / 手柄 A）立即停止本杆循环：当前杆走原版手动收杆路径
   （收杆动画 + 入包结算），停止后 F8 保持开启，之后手动甩竿不会自动循环。
 - **超时重甩**：甩竿后超时无咬钩 → 自动重新甩竿（原版 state2 超时 → 收竿动画 → 续竿点被自动改写回 state0）。
@@ -39,10 +40,15 @@
   - **Hook D（背包满）**依据：rva 0x216B46（state4 咬钩结算入包调用点，覆盖 45 字节，resume 0x216B73）。
     stub 复放 `call 0x138BC0`（持有物添加+容量判定，满时发消息 0x3EB 并返回 0，成功返回 1），
     按返回值维护 gBagFull（满→停）+ gFishCount（已钓计数）；清包后自动恢复。
+  - **Hook E（state2 自动拉线，v1.0.4）**依据：rva 0x215D2B（玩家钓鱼状态机 state2 等咬钩中的
+    拉线/咬钩确认键 0x498 判定点，覆盖 16 字节，resume 0x215D3B）。原版只有 `sil(=按键查询结果)!=0`
+    才写 `[player+0x1DC]=3` 创建节奏任务（进 state3）；挂机永远不按 → 任务不创建 → 自动判定无从触发，
+    这是"挂机从不自动入包"的根因。自动模式无条件写 3 = 等效自动按 0x498，挂机也能进 state3 走正规判定；
+    F8 关 / 背包满时完整复放原版（test sil,sil → je 0x215D4D），未按路径语义不变。
   - 玩家对象：+0x1D8 主状态、+0x1DC 目标状态、+0x238 任务指针、+0x240 输入对象、
     +0x290/+0x2A0 浮标对象、+0x2A8 浮标位置、+0x2C8 场景对象；0x497=收杆键、0x498=收线/咬钩确认、0x55a=命中小游戏键。
   - 全局：0x10DFAD0（+0x208 持有物容器、+0x208+0x32B8 背包容器）。
-- 实现方式：纯 C# 加载器 + **四个 hook 点**（stub 640 字节，先 dump 再用 capstone 逐指令校验）：
+- 实现方式：纯 C# 加载器 + **五个 hook 点**（stub 704 字节，先 dump 再用 capstone 逐指令校验）：
   - **Hook A**（rva 0x38A860 入口，15 字节 detour）：开关检查 + 对象守卫 + 全部音符置 2 + 索引置总数 + `gHits` 计数。
   - **Hook B**（rva 0x38B2FD，6 字节，**随 gEnabled 动态同步**）：开启时 NOP 掉成功检查 je，
     关闭时还原原始 `0F 84 81 01 00 00`（关闭=完全原版）。
@@ -51,19 +57,61 @@
     输入描述结构且有副作用，故不采纳。
   - **Hook D**（rva 0x216B46，45 字节）：复放入包参数装载与 `call 0x138BC0`（movabs+call r11 替代
     rip 相对 + rel32），返回后检查 al 维护 gBagFull/gFishCount；只用易失寄存器，r13 保留供 resume。
+  - **Hook E**（rva 0x215D2B，16 字节）：自动拉线。只用易失寄存器 r11；保留 r14（玩家对象）与
+    sil（0x498 查询结果）供原版路径使用；原版复放段完整保留 `40 84 F6`（带 REX.B 前缀的 test sil,sil，
+    不得写成无前缀 `84 F6`）。
 - 热键检测与提示音全部在加载器进程（stub 不调用任何外部 API）；注入已注入进程时先还原旧补丁再重打；
   `--remove` 先校验当前字节为自身 patch 再还原并写日志。
 - Mod 结构：`Program.cs`（入口/CLI）、`Monitor.cs`（监控主循环：多实例跟踪表 + F8 轮询 + 退出按键）、
-  `InstanceMonitor.cs`（v1.0.3 新增：多实例注入/轮询/入口计数/十秒自检、F8 全实例统一翻转）、
-  `Injector.cs`（分配内存/四补丁安装/还原/校验/F8 切换）、`HookStub.cs`（Hook A 机器码+stub 布局编排）、
-  `CastHookStub.cs`（Hook C/D 机器码生成）、`ProcessManager.cs`（定位进程，v1.0.3 支持枚举全部实例）、
-  `PatchState.cs`（注入状态持久化，v1.0.3 起**按进程 PID 分文件** `FishingAutoCatch.state.<pid>`，含四补丁原始字节）、
-  `Win32Api.cs`（P/Invoke）、`Log.cs`（日志）。
+  `InstanceMonitor.cs`（v1.0.3 新增：多实例注入/轮询/入口计数/十秒自检、F8 全实例统一翻转；
+  v1.0.4：自检 Verify 失败自动重新注入，兼容旧版本注入的实例缺 Hook E 的升级场景）、
+  `Injector.cs`（分配内存/五补丁安装/还原/校验/F8 切换）、`HookStub.cs`（Hook A 机器码+stub 布局编排）、
+  `CastHookStub.cs`（Hook C/D/E 机器码生成）、`ProcessManager.cs`（定位进程，v1.0.3 支持枚举全部实例）、
+  `PatchState.cs`（注入状态持久化，v1.0.3 起**按进程 PID 分文件** `FishingAutoCatch.state.<pid>`，含五补丁原始字节；
+  v1.0.4 兼容旧版缺 originalE 的 state 文件）、`Win32Api.cs`（P/Invoke）、`Log.cs`（日志）。
 - 辅助脚本：`scripts/dump_hook_bytes.py`（按 RVA dump village.exe 覆盖段原始字节）、
-  `scripts/verify_stub_v100.py`（stub 结构校验，已随 v1.0.2 更新：验证三口入口计数 `FF 05` 与复放段新偏移）、
+  `scripts/dump_hooke_bytes.py`（v1.0.4 新建：dump 并扫描 0x215D2B 覆盖段，确认 16B 原始字节与跳入点）、
+  `scripts/verify_stub_v100.py`（stub 结构校验，已随 v1.0.4 更新：验证四口入口计数 `FF 05`、Hook E
+  自动/原版两路径的 jmp 槽目标 0x140215D3B/0x140215D4D、新布局偏移 E[560,672) 状态区[672,704)）、
   `scripts/probe_v102.ps1`（实机内存探针：OpenProcess+ReadProcessMemory 读取四 Hook 与 stub 字节）。
 
 ## 更新记录
+
+### 2026-09-24（v1.0.4：补齐"咬钩→拉线→判定→入包"全自动链——新增 Hook E state2 自动拉线，修复挂机从不自动判定）
+
+- **背景（挂机从不自动入包的根因闭环）**：v1.0.3 实机验证确认自动判定确实生效，但用户反馈
+  "只有手动拉线才入包，挂机从不上鱼"。沿 state2（0x215AAE 等咬钩）反汇编定位到**拉线/咬钩确认键
+  0x498 判定点 0x215D2B**：原版只有当玩家按下 0x498（sil≠0）才写 `[player+0x1DC]=3` 创建节奏任务
+  进入 state3（0x215E28），节奏任务里的自动判定（Hook A/B）与入包（Hook D）才有机会执行；
+  挂机时代码永远走 `sil==0 → je 0x215D4D`（只做浮标状态刷新 + 泡水计时，超时收竿重甩），
+  任务从不创建 → 自动判定无从触发 → 永不入包。这正是"开 F8 挂机从不自动判定"的根因。
+- **修复（新增 Hook E）**：在 0x215D2B 打第五个 Hook（覆盖 16 字节，resume 0x215D3B）：
+  - 自动模式（gEnabled==1 且 gBagFull==0）→ 无条件写 `[player+0x1DC]=3`（等效自动按 0x498），
+    使挂机也能创建节奏任务进入 state3，其后自动判定→入包→续竿由 Hook A/B/C/D 完成，形成完整全自动链；
+  - F8 关 / 背包满 → **完整复放原版**：`40 84 F6`（test sil,sil，带 REX 前缀 3B，不得写成 `84 F6`）
+    → `je 0x215D4D`（sil==0 直跳，跳过任务检查与 `call 0x7691e0`）/ 写 3 → resume 0x215D3B
+    （sil≠0，复放"按下"路径，`cmp [r14+0x238],0; call 0x7691e0` 语义保持）。
+  - **跳入点安全**：0x215CD8 jne / 0x215CE1 je / 0x215D04 jmp / 0x215D14 jae 全部落在覆盖区起点
+    （= detour 入口）；全局复扫 state2 无其他跳入覆盖区内部。
+  - **时序安全**：state3 创建任务依赖浮标时间轴播完（0x215E54 je 0x215F70），提前拉线只原地等待，
+    不死卡/不出幽灵鱼；state3 出口 `0x216015 [1DC]=4` / `0x2160A8 [1DC]=6` 不回 state2，不构成死循环。
+- **stub 布局重排（v1.0.4）**：`StubBufferSize` 640 → 704；A[0,176) / C[176,368) / D[368,560) /
+  **E[560,672)** / 状态区[672,704)（26 字节：gEnabled、gHits、gBagFull、gFishCount、gEntryA/C/D/E，
+  gEntryE@694）；四口入口计数（含 Hook E）用于诊断"游戏是否真执行到对应 Hook 点"。
+- **升级兼容**：
+  - `PatchState` 新增 `original5`（Hook E 原始字节）；旧 v1.0.3 state 文件无 original5 时
+    originalE=null，`Remove`/`RestoreIfDoubleInject` 安全跳过（只还原 A/B/C/D）。
+  - 已注入的 v1.0.3 实例缺 Hook E：监控自检（约 10 秒）Verify 失败时**自动重新注入**（先还原旧补丁再重打），
+    无需重启游戏；防死循环（距上次重注入不足 15 秒跳过）。
+  - `Verify` 升级为五 Hook 在位校验 + 26 字节状态区 + `gEntryE`；`ReadLiveState` 新增 entryE；
+    监控窗口新增"入口 E（0x215D2B state2 自动拉线）已执行 N 次"实时打印。
+- **验证**：`dotnet build -c Release` 0 警告 0 错误；`--dump-stub`（704 字节）→
+  `scripts/verify_stub_v100.py` capstone 逐指令校验**全部通过**——四口入口 `FF 05` 存在、
+  Hook E 自动路径写 `[1DC]=3` 后 jmp 槽=0x140215D3B、原版复放 `test sil,sil` 存在、未按路径
+  jmp 槽=0x140215D4D、非易失寄存器（rbx/rbp/r12-r15/rsp）零写入；部署至 `Mods/FishingAutoCatch/`。
+- **待用户实测**：F8 开启甩竿后观察——① 监控窗口出现"入口 E 已执行 N 次"（state2 拉线点命中），
+  ② 无需按键自动进入判定（gHits 增长）、自动入包（入口 D 增长）、自动重甩（入口 C 增长）的完整循环；
+  上鱼时机/视觉反馈如有需求可再调整。
 
 ### 2026-09-24（v1.0.3：修复"重启/双开游戏后 Mod 完全不生效"——监控模式支持多实例，根因定位）
 

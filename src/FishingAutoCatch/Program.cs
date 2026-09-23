@@ -19,7 +19,7 @@ namespace FishingAutoCatch
     internal static class Program
     {
         /// <summary>与 version.txt 同步维护。</summary>
-        public const string Version = "1.0.3";
+        public const string Version = "1.0.4";
 
         private static int Main(string[] args)
         {
@@ -116,7 +116,7 @@ namespace FishingAutoCatch
                             return 0;
 
                         case "--once":
-                            Console.WriteLine("正在为目标进程注入自动钓鱼 Hook（四 Hook：节奏判定/成功检查/续竿/背包满）……");
+                            Console.WriteLine("正在为目标进程注入自动钓鱼 Hook（五 Hook：节奏判定/成功检查/续竿/背包满/自动拉线）……");
                             Console.WriteLine("  进程     : village.exe (PID " + process.Id + ")");
                             Console.WriteLine("  模块基址 : 0x" + moduleBase.ToString("X"));
                             Console.WriteLine(Injector.Install(handle.Handle, process.Id, moduleBase));
@@ -159,7 +159,7 @@ namespace FishingAutoCatch
             Console.WriteLine("  FishingAutoCatch             监控模式：等待游戏启动→对所有实例自动注入→实时显示 F8 开关/已钓条数/背包满→实例重启或双开也自动重注");
             Console.WriteLine("  FishingAutoCatch --once     一次性注入（等待游戏最多 30 秒，操作最新启动的实例）");
             Console.WriteLine("  FishingAutoCatch --status   查询当前开关状态");
-            Console.WriteLine("  FishingAutoCatch --verify   健康检查（四个 Hook 是否在位、触发次数、已钓条数）");
+            Console.WriteLine("  FishingAutoCatch --verify   健康检查（五个 Hook 是否在位、触发次数、已钓条数）");
             Console.WriteLine("  FishingAutoCatch --remove   还原被 Hook 的原始代码");
             Console.WriteLine("  FishingAutoCatch --dump-stub [路径]  输出 stub 机器码用于反汇编验证");
             Console.WriteLine();

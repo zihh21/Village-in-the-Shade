@@ -161,6 +161,73 @@ namespace FishingAutoCatch
             HookStub.WriteImm(code, slots[5], (ulong)flagFishCount);
             HookStub.WriteImm(code, slots[6], (ulong)flagBagFull);
             HookStub.WriteImm(code, resumeSlot, (ulong)resume);
+
+            Array.Copy(code, 0, buf, offset, code.Length);
+        }
+
+        /// <summary>
+        /// Hook E：自动拉线 stub（v1.0.4），写入 buf[offset, offset+~80)。
+        /// 反编译依据：玩家钓鱼状态机 state2（0x215AAE 等咬钩）中 0x498（拉线/咬钩确认键）判定点
+        /// 0x215D2B（覆盖 16B，resume 0x215D3B）。原版"鱼咬钩后玩家按 0x498 拉线"才会创建节奏任务；
+        /// 自动模式无条件写 [r14+0x1DC]=3（等效自动按 0x498），使挂机也能进入 state3 自动判定，
+        /// 否则（F8 关闭 / 背包满）复放原版（sil 决定是否拉线），等待玩家手动按键。
+        /// 只使用易失寄存器 r11，保留 r14（玩家对象）与 sil（0x498 查询结果）供原版路径使用。
+        /// </summary>
+        /// <param name="buf">目标进程 stub 缓冲区（HookStub.Build 写好整体后调用）。</param>
+        /// <param name="offset">本 stub 在缓冲区内的偏移（HookStub.HookEStubOffset）。</param>
+        /// <param name="moduleBase">模块基址（= target − HookRva）。</param>
+        /// <param name="flagEnabled">gEnabled 绝对地址。</param>
+        /// <param name="flagBagFull">gBagFull 绝对地址。</param>
+        public static void BuildHookE(byte[] buf, int offset, long moduleBase,
+            long flagEnabled, long flagBagFull)
+        {
+            long resume = moduleBase + HookStub.HookEResumeRva;          // 0x215D3B
+            long notPressed = moduleBase + HookStub.HookENotPressedRva;  // 0x215D4D（原版未按 0x498 跳转目标）
+            var em = new HookStub.Emitter();
+
+            // ---- 无条件入口计数（v1.0.4 诊断）：判定游戏是否真的执行到 0x215D2B（state2 拉线键判定点） ----
+            em.EmitEntryInc(offset, HookStub.FlagEntryEOffset); // inc dword [rip+disp32] ← gEntryE
+
+            // ---- 判定1：gEnabled==0 → 走原版复放路径 ----
+            em.MovAbsR11(flagEnabled);
+            em.Bytes(0x41, 0x80, 0x3B, 0x00);                             // cmp byte [r11], 0
+            em.Jcc8(0x74, "vanilla");                                    // je vanilla
+
+            // ---- 判定2：gBagFull==1 → 走原版复放路径（背包满，等玩家手动收杆清包） ----
+            em.MovAbsR11(flagBagFull);
+            em.Bytes(0x41, 0x80, 0x3B, 0x00);                             // cmp byte [r11], 0
+            em.Jcc8(0x75, "vanilla");                                    // jne vanilla
+
+            // ---- 自动模式：无条件写入 [1DC]=3（等效玩家按 0x498 拉线，进入 state3 判定） ----
+            em.Bytes(0x41, 0xC7, 0x86, 0xDC, 0x01, 0x00, 0x00,
+                     0x03, 0x00, 0x00, 0x00);                             // mov dword [r14+0x1DC], 3
+            em.Bytes(0xFF, 0x25, 0x00, 0x00, 0x00, 0x00);                 // jmp qword [rip+0]
+            int resumeSlotAuto = em.Pos;
+            em.Bytes(0, 0, 0, 0, 0, 0, 0, 0);
+
+            // ---- 原版复放：test sil,sil；未按 0x498 → 跳原版 0x215D4D（超时等待）；按下 → 写 [1DC]=3 后 resume ----
+            em.Label("vanilla");
+            em.Bytes(0x40, 0x84, 0xF6);                                   // test sil, sil
+            em.Jcc8(0x74, "notPressed");                                 // je notPressed
+            em.Bytes(0x41, 0xC7, 0x86, 0xDC, 0x01, 0x00, 0x00,
+                     0x03, 0x00, 0x00, 0x00);                             // mov dword [r14+0x1DC], 3
+            em.Bytes(0xFF, 0x25, 0x00, 0x00, 0x00, 0x00);                 // jmp qword [rip+0]
+            int resumeSlotVanilla = em.Pos;
+            em.Bytes(0, 0, 0, 0, 0, 0, 0, 0);
+
+            // ---- 原版未按 0x498：直接跳回 0x215D4D（跳过写状态，走浮标状态/超时等待） ----
+            em.Label("notPressed");
+            em.Bytes(0xFF, 0x25, 0x00, 0x00, 0x00, 0x00);                 // jmp qword [rip+0]
+            int resumeSlotNot = em.Pos;
+            em.Bytes(0, 0, 0, 0, 0, 0, 0, 0);
+
+            byte[] code = em.Finish();
+            var slots = em.Imm64Slots;                                    // 0=&gEnabled 1=&gBagFull
+            HookStub.WriteImm(code, slots[0], (ulong)flagEnabled);
+            HookStub.WriteImm(code, slots[1], (ulong)flagBagFull);
+            HookStub.WriteImm(code, resumeSlotAuto, (ulong)resume);
+            HookStub.WriteImm(code, resumeSlotVanilla, (ulong)resume);
+            HookStub.WriteImm(code, resumeSlotNot, (ulong)notPressed);
             Array.Copy(code, 0, buf, offset, code.Length);
         }
     }
