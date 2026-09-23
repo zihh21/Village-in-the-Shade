@@ -56,5 +56,13 @@ namespace FishingAutoCatch
             if (mod == IntPtr.Zero) return 0;
             return GetProcAddress(mod, "GetAsyncKeyState").ToInt64();
         }
+
+        /// <summary>解析 kernel32!Beep 地址（F8 切换提示音，stub 内调用）。</summary>
+        public static long BeepAddress()
+        {
+            IntPtr mod = GetModuleHandleA("kernel32.dll");
+            if (mod == IntPtr.Zero) return 0;
+            return GetProcAddress(mod, "Beep").ToInt64();
+        }
     }
 }

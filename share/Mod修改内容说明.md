@@ -4,14 +4,15 @@
 
 ## 当前包含的 Mod
 
-### 1. FishingAutoCatch 钓鱼自动收杆 `v0.1.0`
+### 1. FishingAutoCatch 钓鱼自动收杆 `v0.2.0`
 
 | 项目 | 内容 |
 |---|---|
 | 目录 | `src/FishingAutoCatch/`（C# 加载器，net8.0/x64） |
 | 生效范围 | 全局（任意地点钓鱼均生效） |
-| 热键 | **F8**：开启/关闭；注入后默认开启 |
-| 用法 | 先启动《Village in the Shade》并进入标题画面后，运行 `Mods/FishingAutoCatch/FishingAutoCatch.exe`（或 `--status` 查询、`--remove` 还原）；重启游戏后需重新注入 |
+| 热键 | **F8**：开启/关闭；注入后默认开启。切换时游戏内发出提示音（开启 880Hz、关闭 440Hz，各 100ms） |
+| 用法 | 运行 `Mods/FishingAutoCatch/FishingAutoCatch.exe`（推荐不带参数进入**监控模式**：自动等待游戏启动后注入、游戏重启后自动重新注入、实时显示 F8 状态与触发次数，按任意键退出监控）；另支持 `--once`（一次性注入）、`--status`（查状态）、`--verify`（健康检查+触发计数）、`--remove`（还原）、`--dump-stub`（调试） |
+| 补充 | 每次运行写入 `FishingAutoCatch.log`（exe 同目录），窗口常驻不会一闪而过 |
 
 **功能**：
 
@@ -26,12 +27,26 @@
 
 - 反编译依据：`village.exe` rva 0x38A860（CTask_Menu_Fishing::update 判定函数）、成功路径 0x38B2E6→0x38B343、
   汇合点 0x38B114。详见 `docs/钓鱼节奏小游戏分析.md`。
-- 实现方式：纯 C# 加载器 + 15 字节 inline hook（`jmp` 到注入内存的 230 字节 stub）。
-- Mod 结构：`Program.cs`（入口/CLI）、`Injector.cs`（分配内存/打补丁/还原/校验）、
-  `HookStub.cs`（机器码生成器，含对象偏移与反编译注释）、`ProcessManager.cs`（定位进程）、
-  `PatchState.cs`（注入状态持久化）、`Win32Api.cs`（P/Invoke）。
+- 实现方式：纯 C# 加载器 + 15 字节 inline hook（`jmp` 到注入内存的 280 字节 stub）。
+- stub 内：F8 沿触发（GetAsyncKeyState）切换开关并调用 `kernel32!Beep` 发提示音；
+  每次真正执行"自动判定"时递增 `gHits` 计数供加载器显示（便于确认 Hook 生效）。
+- 注入到已注入的进程时会先还原旧补丁再重打，避免状态文件与内存不一致。
+- Mod 结构：`Program.cs`（入口/CLI）、`Monitor.cs`（监控模式：等待/自动注入/重启重注/实时状态）、
+  `Injector.cs`（分配内存/打补丁/还原/校验）、`HookStub.cs`（机器码生成器，含对象偏移与反编译注释）、
+  `ProcessManager.cs`（定位进程）、`PatchState.cs`（注入状态持久化）、`Win32Api.cs`（P/Invoke）、`Log.cs`（日志）。
 
 ## 更新记录
+
+### 2026-09-23（v0.2.0：修复闪退与 F8 提示）
+
+- **修复**：双击 exe"打开窗口直接闪退"——原版是控制台跑完即关、无输出可读；现改为
+  **默认进入监控模式**（窗口常驻），异常全量写入 `FishingAutoCatch.log`，运行结束后保留窗口提示。
+- **修复**：钓鱼系统"没有任何变动"——主要诱因是游戏未启动/重启后未重新注入；
+  监控模式会自动等待游戏进程、注入，并在游戏重启后**自动重新注入**，无需再手动踩时机。
+- **新增**：F8 开启/关闭提示——游戏内发出提示音（开启 880Hz / 关闭 440Hz，100ms），
+  监控窗口同步滚动显示开关状态与"自动判定已触发 N 次"。
+- **新增**：stub 内 `gHits` 命中计数器 + `--verify` 健康检查（Hook 是否在位、触发次数），便于确认 Mod 实际生效。
+- **新增**：防重复注入保护（先还原旧补丁再重打）；默认保持开启行为不变。
 
 ### 2026-09-23（首次初始化）
 

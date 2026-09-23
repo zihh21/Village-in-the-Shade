@@ -1,5 +1,4 @@
 using System;
-using System.Text;
 
 namespace FishingAutoCatch
 {
@@ -8,6 +7,8 @@ namespace FishingAutoCatch
     /// 覆盖字节（HookStub.PatchLength=15）：mov rax,rsp / mov[rax+10],rbx / mov[rax+18],rsi / mov[rax+20],rdi，
     /// 替换为 `FF 25 00000000 <stub基址8字节> 90`（jmp qword[rip+0] → stub）。
     /// stub 末尾复放这 15 字节并跳回 target+15（0x...A86F push rbp 处）继续原函数执行。
+    ///
+    /// 状态字节（stub 缓冲区尾部，由注入器写入）：gEnabled(1B) + gLastF8(1B) + gHits(4B)。
     /// </summary>
     internal static class Injector
     {
@@ -18,8 +19,14 @@ namespace FishingAutoCatch
         {
             long target = moduleBase + HookStub.HookRva;
             long getAsyncKeyState = Win32Api.GetAsyncKeyStateAddress();
+            long beep = Win32Api.BeepAddress();
             if (getAsyncKeyState == 0)
                 return "解析 user32!GetAsyncKeyState 失败，无法注入。";
+            if (beep == 0)
+                return "解析 kernel32!Beep 失败，无法注入（F8 提示音依赖）。";
+
+            // 0) 防重复注入：若游戏当前正是本工具上一次注入的 patch（状态文件仍在），先还原为原始字节再重打
+            RestoreIfDoubleInject(hProcess, moduleBase, target);
 
             // 1) 读取被覆盖前的原始字节（用于状态文件/还原）
             var original = new byte[HookStub.PatchLength];
@@ -35,10 +42,10 @@ namespace FishingAutoCatch
             long stubBase = stubBasePtr.ToInt64();
 
             // 3) 生成并写入 stub 代码（绝对地址按 stubBase 回填）
-            byte[] code = HookStub.Build(stubBase, target, getAsyncKeyState);
+            byte[] code = HookStub.Build(stubBase, target, getAsyncKeyState, beep);
             if (!WriteAt(hProcess, stubBase, code))
                 return "写入 stub 代码失败。";
-            byte[] flags = { 0x01, 0x00 }; // gEnabled=1（默认开启）, gLastF8=0
+            byte[] flags = { 0x01, 0x00, 0x00, 0x00, 0x00 }; // gEnabled=1(默认开启), gLastF8=0, gHits=0
             if (!WriteAt(hProcess, stubBase + HookStub.FlagEnabledOffset, flags))
                 return "写入状态字节失败。";
 
@@ -56,7 +63,19 @@ namespace FishingAutoCatch
             return $"注入成功。\n" +
                    $"  Hook 点   : 0x{target:X}\n" +
                    $"  Stub 基址 : 0x{stubBase:X}\n" +
-                   $"  默认开关  : 开启（游戏中按 F8 切换）";
+                   $"  默认开关  : 开启（游戏中按 F8 切换，开启 880Hz/关闭 440Hz 提示音）";
+        }
+
+        /// <summary>若目标当前字节正是本模块上次写入的 patch，则先还原原始字节并释放旧 stub，再让 Install 重打。</summary>
+        private static void RestoreIfDoubleInject(IntPtr hProcess, long moduleBase, long target)
+        {
+            if (!PatchState.TryLoad(out var m, out var stubBase, out var original)) return;
+            if (m != moduleBase) return;
+            var cur = new byte[HookStub.PatchLength];
+            if (!ReadAt(hProcess, target, cur)) return;
+            if (!IsOurPatch(cur, stubBase)) return;
+            if (ProtectWriteVerify(hProcess, target, original))
+                Win32Api.VirtualFreeEx(hProcess, new IntPtr(stubBase), IntPtr.Zero, 0x8000 /*MEM_RELEASE*/);
         }
 
         /// <summary>还原 Hook（要求当前字节仍为本模块的 patch 签名，且模块基址一致）。</summary>
@@ -82,13 +101,43 @@ namespace FishingAutoCatch
             return "已还原原始代码并释放 stub 内存。";
         }
 
-        /// <summary>读取游戏内 gEnabled 开关，返回 1=开启 0=关闭。</summary>
+        /// <summary>读取游戏内 gEnabled 开关，返回 1=开启 0=关闭，-1=未注入。</summary>
         public static int ReadEnabledState(IntPtr hProcess)
         {
             if (!PatchState.TryLoad(out var moduleBase, out var stubBase, out _)) return -1;
             var buf = new byte[1];
             if (!ReadAt(hProcess, stubBase + HookStub.FlagEnabledOffset, buf)) return -1;
             return buf[0];
+        }
+
+        /// <summary>健康检查：Hook 点是否仍是本模块的 patch、开关状态与自动判定累计次数。</summary>
+        public static string Verify(IntPtr hProcess, long moduleBase)
+        {
+            if (!PatchState.TryLoad(out var m, out var stubBase, out _))
+                return "状态文件缺失：尚未注入过本模块。";
+            if (m != moduleBase)
+                return "模块基址与注入时不符：游戏可能已重启，需重新注入。";
+
+            long target = moduleBase + HookStub.HookRva;
+            var cur = new byte[HookStub.PatchLength];
+            if (!ReadAt(hProcess, target, cur)) return "读取 Hook 点失败。";
+            if (!IsOurPatch(cur, stubBase))
+                return "Hook 点字节与记录不符：patch 已被覆盖（需重新注入）。";
+
+            var st = new byte[5];
+            if (!ReadAt(hProcess, stubBase + HookStub.FlagEnabledOffset, st)) return "读取 stub 状态失败。";
+            int hits = BitConverter.ToInt32(st, 2);
+            return $"Hook 在位。开关={st[0]}（1=开），自动判定累计触发 {hits} 次。";
+        }
+
+        /// <summary>供监控模式读取实时开关与命中计数；模块基址与记录不符（游戏重启）时返回 null。</summary>
+        public static (int enabled, int hits)? ReadLiveState(IntPtr hProcess, long moduleBase)
+        {
+            if (!PatchState.TryLoad(out var m, out var stubBase, out _)) return null;
+            if (m != moduleBase) return null;
+            var st = new byte[5];
+            if (!ReadAt(hProcess, stubBase + HookStub.FlagEnabledOffset, st)) return null;
+            return (st[0], BitConverter.ToInt32(st, 2));
         }
 
         /// <summary>校验当前 15 字节是否为指向 stubBase 的 detour。</summary>
@@ -141,7 +190,8 @@ namespace FishingAutoCatch
             long baseAddr = 0x140100000L;   // 假基址
             long target = 0x140000000L + HookStub.HookRva;
             long gask = 0x7FF800000000L;    // 假 GetAsyncKeyState
-            return HookStub.Build(baseAddr, target, gask);
+            long beep = 0x7FF800000100L;    // 假 Beep
+            return HookStub.Build(baseAddr, target, gask, beep);
         }
     }
 }
