@@ -66,13 +66,18 @@ namespace FishingAutoCatch
                 return "写入状态字节失败。";
 
             // 4) 四个 Hook 点 detour / NOP
+            //    Hook A → stub 区开头（Hook A 区偏移 0）；Hook C → stubBase+CastStubOffset（续竿区）；
+            //    Hook D → stubBase+BagStubOffset（入包区）。若 C/D 也指向 stubBase 会跳进 Hook A stub，
+            //    在 state5/state4 上下文中乱读 rcx 并 trampoline 到节奏判定内部，破坏整个钓鱼状态机（v1.0.0 缺陷）。
             if (!ProtectWriteVerify(hProcess, targetA, BuildDetourPatch(stubBase, HookStub.PatchLength)))
                 return "写入 detour（Hook A）失败或校验不一致。";
             if (!ProtectWriteVerify(hProcess, targetB, HookStub.SuccessPatch))
                 return "写入成功检查补丁（Hook B）失败或校验不一致。";
-            if (!ProtectWriteVerify(hProcess, targetC, BuildDetourPatch(stubBase, HookStub.CastPatchLength)))
+            if (!ProtectWriteVerify(hProcess, targetC,
+                    BuildDetourPatch(stubBase + HookStub.CastStubOffset, HookStub.CastPatchLength)))
                 return "写入 detour（Hook C）失败或校验不一致。";
-            if (!ProtectWriteVerify(hProcess, targetD, BuildDetourPatch(stubBase, HookStub.BagPatchLength)))
+            if (!ProtectWriteVerify(hProcess, targetD,
+                    BuildDetourPatch(stubBase + HookStub.BagStubOffset, HookStub.BagPatchLength)))
                 return "写入 detour（Hook D）失败或校验不一致。";
 
             // 5) 记录状态并返回
@@ -88,6 +93,8 @@ namespace FishingAutoCatch
 
         /// <summary>
         /// 若四个 Hook 点当前正是本模块上次写入的内容，则先还原原始字节并释放旧 stub，再让 Install 重打。
+        /// v1.0.0 曾把 Hook C/D 的 detour 误指向 stubBase（Hook A 区），此处同时识别新（+CastStubOffset/+BagStubOffset）
+        /// 与旧（指向 stubBase）两种形态，保证旧补丁也能被还原。
         /// </summary>
         private static void RestoreIfDoubleInject(IntPtr hProcess, long moduleBase,
             long targetA, long targetB, long targetC, long targetD)
@@ -103,9 +110,11 @@ namespace FishingAutoCatch
             var curB = new byte[HookStub.SuccessPatchLength];
             bool bOurs = originalB != null && ReadAt(hProcess, targetB, curB) && ArraysEqual(curB, HookStub.SuccessPatch);
             var curC = new byte[HookStub.CastPatchLength];
-            bool cOurs = originalC != null && ReadAt(hProcess, targetC, curC) && IsOurPatch(curC, stubBase);
+            bool cOurs = originalC != null && ReadAt(hProcess, targetC, curC)
+                         && IsOurPatchAny(curC, stubBase, stubBase + HookStub.CastStubOffset);
             var curD = new byte[HookStub.BagPatchLength];
-            bool dOurs = originalD != null && ReadAt(hProcess, targetD, curD) && IsOurPatch(curD, stubBase);
+            bool dOurs = originalD != null && ReadAt(hProcess, targetD, curD)
+                         && IsOurPatchAny(curD, stubBase, stubBase + HookStub.BagStubOffset);
             if (!wasOurs && !bOurs && !cOurs && !dOurs) return;
 
             if (wasOurs && originalA != null) ProtectWriteVerify(hProcess, targetA, originalA);
@@ -156,7 +165,8 @@ namespace FishingAutoCatch
             {
                 var curC = new byte[HookStub.CastPatchLength];
                 if (!ReadAt(hProcess, targetC, curC)) return "读取 Hook 点 C 失败。";
-                if (!IsOurPatch(curC, stubBase))
+                // 兼容 v1.0.0 旧误指 stubBase 的 patch 与新（+CastStubOffset）形态
+                if (!IsOurPatchAny(curC, stubBase, stubBase + HookStub.CastStubOffset))
                     return "Hook 点 C 当前内容不是本模块的 patch，跳过还原（可能已被其他工具修改）。";
                 if (!ProtectWriteVerify(hProcess, targetC, originalC))
                     return "还原 Hook C 失败或校验不一致。";
@@ -166,7 +176,7 @@ namespace FishingAutoCatch
             {
                 var curD = new byte[HookStub.BagPatchLength];
                 if (!ReadAt(hProcess, targetD, curD)) return "读取 Hook 点 D 失败。";
-                if (!IsOurPatch(curD, stubBase))
+                if (!IsOurPatchAny(curD, stubBase, stubBase + HookStub.BagStubOffset))
                     return "Hook 点 D 当前内容不是本模块的 patch，跳过还原（可能已被其他工具修改）。";
                 if (!ProtectWriteVerify(hProcess, targetD, originalD))
                     return "还原 Hook D 失败或校验不一致。";
@@ -198,7 +208,7 @@ namespace FishingAutoCatch
             return buf[0];
         }
 
-        /// <summary>健康检查：四个 Hook 点是否在位、Hook B 与开关状态是否一致、开关状态与两条计数。</summary>
+        /// <summary>健康检查：四个 Hook 点是否在位（含 C/D 指向正确 stub 区）、Hook B 与开关状态是否一致、开关状态与两条计数。</summary>
         public static string Verify(IntPtr hProcess, long moduleBase)
         {
             if (!PatchState.TryLoad(out var m, out var stubBase, out _, out var originalB, out _, out _))
@@ -211,6 +221,18 @@ namespace FishingAutoCatch
             if (!ReadAt(hProcess, targetA, curA)) return "读取 Hook 点 A 失败。";
             if (!IsOurPatch(curA, stubBase))
                 return "Hook 点 A 字节与记录不符：patch 已被覆盖（需重新注入）。";
+
+            // Hook C/D 的 detour 必须指向各自 stub 区（v1.0.0 曾误指向 stubBase 导致状态机错乱）
+            long targetC = moduleBase + HookStub.CastRva;
+            var curC = new byte[HookStub.CastPatchLength];
+            if (!ReadAt(hProcess, targetC, curC)) return "读取 Hook 点 C 失败。";
+            if (!IsOurPatch(curC, stubBase + HookStub.CastStubOffset))
+                return "Hook 点 C detour 未指向续竿 stub 区（可能仍是 v1.0.0 错误补丁），需重新注入。";
+            long targetD = moduleBase + HookStub.BagRva;
+            var curD = new byte[HookStub.BagPatchLength];
+            if (!ReadAt(hProcess, targetD, curD)) return "读取 Hook 点 D 失败。";
+            if (!IsOurPatch(curD, stubBase + HookStub.BagStubOffset))
+                return "Hook 点 D detour 未指向入包 stub 区（可能仍是 v1.0.0 错误补丁），需重新注入。";
 
             var st = new byte[10];
             if (!ReadAt(hProcess, stubBase + HookStub.FlagEnabledOffset, st)) return "读取 stub 状态失败。";
@@ -279,15 +301,23 @@ namespace FishingAutoCatch
             return patch;
         }
 
-        /// <summary>校验"入口 detour"是否为指向 stubBase 的 jmp（比较前 14 字节 + stubBase 地址）。</summary>
-        private static bool IsOurPatch(byte[] current, long stubBase)
+        /// <summary>校验"入口 detour"是否为指向 targetStubAddr 的 jmp（比较前 14 字节 + 地址）。</summary>
+        private static bool IsOurPatch(byte[] current, long targetStubAddr)
         {
             if (current.Length < 14) return false;
             for (int i = 0; i < Signature.Length; i++)
                 if (current[i] != Signature[i]) return false;
             for (int i = 0; i < 8; i++)
-                if (current[6 + i] != (byte)((ulong)stubBase >> (8 * i))) return false;
+                if (current[6 + i] != (byte)((ulong)targetStubAddr >> (8 * i))) return false;
             return true;
+        }
+
+        /// <summary>detour 是否指向候选地址之一（用于兼容新/旧两种 stub 区指向）。</summary>
+        private static bool IsOurPatchAny(byte[] current, params long[] candidates)
+        {
+            foreach (var c in candidates)
+                if (IsOurPatch(current, c)) return true;
+            return false;
         }
 
         private static bool ReadAt(IntPtr h, long addr, byte[] buf)

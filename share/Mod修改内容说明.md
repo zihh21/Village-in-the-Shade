@@ -4,7 +4,7 @@
 
 ## 当前包含的 Mod
 
-### 1. FishingAutoCatch 自动钓鱼 `v1.0.0`
+### 1. FishingAutoCatch 自动钓鱼 `v1.0.1`
 
 | 项目 | 内容 |
 |---|---|
@@ -61,6 +61,22 @@
   `scripts/verify_stub_v100.py`（stub 结构校验）。
 
 ## 更新记录
+
+### 2026-09-24（v1.0.1：修复 Hook C/D detour 误指向导致自动钓鱼完全失效）
+
+- **修复**：v1.0.0 注入后"自动钓鱼完全没有生效（连原有跳过小游戏也失效）"——
+  根因是 `Injector.Install` 给 Hook C（续竿 0x216C9C）与 Hook D（入包 0x216B46）打 detour 时
+  **误把目标设为 `stubBase`（= Hook A 区开头）**，而应为 `stubBase+CastStubOffset(176)` / `stubBase+BagStubOffset(368)`。
+  后果：游戏执行到 state5 续竿点 / state4 入包点时会直接跳进 Hook A stub 入口——
+  Hook A stub 假定 rcx 为 CTask_Menu_Fishing*（此刻实为状态机寄存器值），乱读守卫后
+  trampoline 复放 prologue（写坏当前栈帧）并 jmp 到 0x...A86F（节奏判定函数内部），
+  钓鱼状态机执行流与栈帧被彻底破坏，表现为"开启后与原版无异、没有任何功能"。
+  由于 `Verify` 只校验 Hook A detour 签名与 Hook B 一致性，不校验 C/D 指向，自检始终误报"均在位"。
+- **调整**：`RestoreIfDoubleInject` / `Remove` 对 Hook C/D 兼容两种 patch 形态（旧的误指 stubBase 与新指向各自 stub 区），
+  保证旧错误补丁可被正确还原；`Verify` 新增 Hook C/D detour 指向校验（未指向对应 stub 区即报警并提示重新注入）。
+- **验证**：内存探针确认 v1.0.0 实际打出的 Hook C/D detour 8 字节目标均为 `0x1CD76900000`（stub 基址）而非各自 stub 区；
+  修复后重新构建 `dotnet build -c Release` 通过（0 警告 0 错误），部署至 `Mods/FishingAutoCatch/`。
+- **使用提示**：若已用 v1.0.0 注入过游戏，请先关闭再重启游戏（或用旧版 `--remove` 还原），再运行 v1.0.1 注入。
 
 ### 2026-09-24（v1.0.0：自动钓鱼——自动循环 + 手动停止 + 超时重甩 + 背包满自动停）
 
