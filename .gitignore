@@ -25,3 +25,6 @@ Mods/
 *.bin
 *.tmp
 FishingAutoCatch.original.bin
+
+# ===== 分享包输出目录（不入库） =====
+dist/
