@@ -48,6 +48,9 @@ namespace FishingAutoCatch
             long resume = moduleBase + HookStub.CastResumeRva;
             var em = new HookStub.Emitter();
 
+            // ---- 无条件入口计数（v1.0.2 诊断）：判定游戏是否真的执行到 0x216C9C（state5 收竿完成点） ----
+            em.EmitEntryInc(offset, HookStub.FlagEntryCOffset); // inc dword [rip+disp32] ← gEntryC
+
             // ---- 复放被覆盖的原始指令 ----
             // 0x216C9C movsd xmm0,[rsp+0x50]（6B：F2 0F 10 44 24 50）
             // 0x216CA2 movsd [r14+0x2A8],xmm0（9B：F2 41 0F 11 86 A8 02 00 00，REX 在前缀组最后）
@@ -106,6 +109,9 @@ namespace FishingAutoCatch
             long global = moduleBase + HookStub.GlobalRva;
             long addHold = moduleBase + HookStub.AddHoldRva;
             var em = new HookStub.Emitter();
+
+            // ---- 无条件入口计数（v1.0.2 诊断）：判定游戏是否真的执行到 0x216B46（state4 入包调用点） ----
+            em.EmitEntryInc(offset, HookStub.FlagEntryDOffset); // inc dword [rip+disp32] ← gEntryD
 
             // ---- 复放入包调用：rax = *(0x10DFAD0)；rcx=[rax+0x208]；参数 & call 0x138BC0 ----
             em.MovAbsR11(global);                                              // movabs r11, &全局变量地址

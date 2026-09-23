@@ -1,11 +1,17 @@
 # -*- coding: utf-8 -*-
-"""FishingAutoCatch v1.0.0 stub 结构校验（对齐指令边界 + 绝对地址槽）。
+"""FishingAutoCatch v1.0.2 stub 结构校验（对齐指令边界 + 绝对地址槽）。
+
+v1.0.2 变更：Hook A/C/D 三个 stub 入口各增加 6 字节无条件入口计数
+（`FF 05 disp32` → inc dword[rip+disp32]），因此：
+  - Hook C 区 movsd 复放段由偏移 176 后移至 182；
+  - Hook D 区复放段（stub 偏移 13 起）后移 6 字节。
 
 关键校验：
   1. Hook C 复放 movsd 两条与原始字节完全一致。
   2. 所有 jmp qword[rip+0] 槽后的 8 字节 = 期望 resume/module 地址。
   3. stub 内未使用 rbx/r13/r14（非易失寄存器）作为写入目标（r14 读基址除外，保留）。
   4. rel8 跳转目标落在指令标签处。
+  5. 三个入口的 `FF 05` 入口计数指令存在（偏移 0 / 176 / 368）。
 """
 import struct
 from capstone import Cs, CS_ARCH_X86, CS_MODE_64
@@ -26,6 +32,9 @@ EXPECT = {
     "gHits": STUB_BASE + 561,
     "gBagFull": STUB_BASE + 565,
     "gFishCount": STUB_BASE + 566,
+    "gEntryA": STUB_BASE + 570,
+    "gEntryC": STUB_BASE + 574,
+    "gEntryD": STUB_BASE + 578,
 }
 
 FAILS = []
@@ -52,17 +61,19 @@ for it in ins:
 
 # ---------- Hook C [176,368) ----------
 print("==== Hook C ====")
+# v1.0.2：偏移 176 起是 6 字节入口计数 inc dword[rip+disp32]（FF 05），movsd 复放段后移至 182
+chk(data[176:178] == bytes.fromhex("FF 05"), "Hook C 缺少 v1.0.2 入口计数指令 FF 05")
 # 被覆盖原始字节（26 字节）：前 15B 是 movsd×2 必须复放一致；后 11B 是 mov dword[1DC],1
 # 由我们的写 0/写 1 判定逻辑替换，不复放。
 CAST_REPLAY = bytes.fromhex("F2 0F 10 44 24 50  F2 41 0F 11 86 A8 02 00 00")
-chk(data[176:176+15] == CAST_REPLAY, f"Hook C movsd 复放与原字节不一致")
-print(f"  movsd 复放: {'一致' if data[176:176+15] == CAST_REPLAY else '不一致'}")
-ins = list(md.disasm(data[176:176+26], 176))
+chk(data[182:182+15] == CAST_REPLAY, f"Hook C movsd 复放与原字节不一致")
+print(f"  movsd 复放: {'一致' if data[182:182+15] == CAST_REPLAY else '不一致'}")
+ins = list(md.disasm(data[182:182+26], 182))
 for it in ins:
     print(f"  0x{it.address:03X}: {it.mnemonic}\t{it.op_str}")
-# 检查 stub 生成区（176+26 起）：寻找 je/jne/jmp 并核对槽
-stubC = data[176+26:368]
-insC = list(md.disasm(stubC, 176+26))
+# 检查 stub 生成区（182+26 起）：寻找 je/jne/jmp 并核对槽
+stubC = data[182+26:368]
+insC = list(md.disasm(stubC, 182+26))
 for it in insC:
     if it.mnemonic == "jmp" and it.op_str == "qword ptr [rip]":
         slot = read_abs(0, it.address + 6)
@@ -73,9 +84,11 @@ for it in insC:
 
 # ---------- Hook D [368,560) ----------
 print("==== Hook D ====")
+# v1.0.2：偏移 368 起是 6 字节入口计数 inc dword[rip+disp32]（FF 05）
+chk(data[368:370] == bytes.fromhex("FF 05"), "Hook D 缺少 v1.0.2 入口计数指令 FF 05")
 code = data[368:368+45]
 print("  stub 前 45 字节:", code.hex(" "))
-# 原 0x216B4D 起（mov rcx,[rax+0x208] 到 call 前）共 33 字节应与 stub 中 0x17D 起逐字节一致
+# 原 0x216B4D 起（mov rcx,[rax+0x208] 到 call 前）共 33 字节应与 stub 中复放段逐字节一致
 BAG_REPLAY = bytes.fromhex(
     "48 8B 88 08 02 00 00"   # mov rcx,[rax+0x208]
     "C6 44 24 20 01"         # mov byte [rsp+0x20],1
@@ -83,9 +96,9 @@ BAG_REPLAY = bytes.fromhex(
     "BA 1A 04 00 00"         # mov edx,0x41a
     "41 B8 06 00 00 00"      # mov r8d,6
     "48 8B 89 B8 32 00 00")  # mov rcx,[rcx+0x32b8]
-# 复放段从 stub 偏移 13 起共 33 字节，因 movabs(13B) 比原 mov rax,[rip](7B) 长 6B，
-# 复放会延伸到 46 字节处（超出原 45B 覆盖区属正常，stub 区总长 192B），需用完整缓冲区比较。
-replay = data[368 + 13:368 + 13 + 33]
+# 入口计数 6B + movabs(10B) + mov rax,[r11](3B) = 复放段从 stub 偏移 19 起共 33 字节，
+# 因 movabs(10B) 比原 mov rax,[rip](7B) 长 3B？—— 实际复放段从 368+6+10+3=387 起，用完整缓冲区比较。
+replay = data[368 + 6 + 13:368 + 6 + 13 + 33]
 print(f"  复放段（mov rcx 起 33B）: {'一致' if replay == BAG_REPLAY else '不一致'}")
 chk(replay == BAG_REPLAY, "Hook D 复放段与原始不一致")
 insD = list(md.disasm(code, 368))

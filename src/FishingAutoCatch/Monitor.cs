@@ -39,6 +39,7 @@ namespace FishingAutoCatch
             bool f8Down = false;
             int tick = 0;
             bool quit = false;
+            int lastEntryA = -1, lastEntryC = -1, lastEntryD = -1;
 
             while (!quit)
             {
@@ -61,7 +62,7 @@ namespace FishingAutoCatch
                 // ---- 进程状态/注入轮询（约 500ms 一次） ----
                 if (!quit && tick % StateIntervalTicks == 0)
                     PollState(ref injected, ref lastPid, ref lastEnabled, ref lastHits,
-                              ref lastFishCount, ref lastBagFull);
+                              ref lastFishCount, ref lastBagFull, ref lastEntryA, ref lastEntryC, ref lastEntryD);
 
                 if (!quit) Thread.Sleep(100);
             }
@@ -129,9 +130,10 @@ namespace FishingAutoCatch
             }
         }
 
-        /// <summary>约 500ms 一次：等待/注入游戏，或轮询开关、命中次数、已钓条数与背包满状态。</summary>
+        /// <summary>约 500ms 一次：等待/注入游戏，或轮询开关、命中次数、已钓条数、背包满状态与三口入口计数。</summary>
         private static void PollState(ref bool injected, ref long lastPid, ref int lastEnabled,
-            ref int lastHits, ref int lastFishCount, ref int lastBagFull)
+            ref int lastHits, ref int lastFishCount, ref int lastBagFull,
+            ref int lastEntryA, ref int lastEntryC, ref int lastEntryD)
         {
             try
             {
@@ -149,6 +151,9 @@ namespace FishingAutoCatch
                             lastHits = -1;
                             lastFishCount = -1;
                             lastBagFull = -1;
+                            lastEntryA = -1;
+                            lastEntryC = -1;
+                            lastEntryD = -1;
                         }
                         return;
                     }
@@ -165,19 +170,27 @@ namespace FishingAutoCatch
                             string result = Injector.Install(handle.Handle, moduleBase);
                             Console.WriteLine("  " + result.Replace("\n", "\n  "));
                             Log.Write($"注入 PID={pid}: " + result.Replace("\n", " | "));
+                            // 关键日志：注入后立即回读四个 Hook 点的真实字节，供比对 patch 是否写入到位
+                            string hookBytes = Injector.DumpHookBytes(handle.Handle, moduleBase);
+                            Console.WriteLine("  [注入回读] " + hookBytes);
+                            Log.Write($"注入回读 {hookBytes}");
                             string check = Injector.Verify(handle.Handle, moduleBase);
                             Console.WriteLine("  " + check);
+                            Log.Write("注入后 Verify: " + check);
                             injected = true;
                             lastPid = pid;
                             lastEnabled = -1;
                             lastHits = -1;
                             lastFishCount = -1;
                             lastBagFull = -1;
+                            lastEntryA = -1;
+                            lastEntryC = -1;
+                            lastEntryD = -1;
                         }
                         return;
                     }
 
-                    // 已注入：轮询开关、命中计数、已钓条数与背包满状态
+                    // 已注入：轮询开关、命中计数、已钓条数、背包满状态与入口计数
                     using (var handle = new SafeProcessHandle(p))
                     {
                         var state = Injector.ReadLiveState(handle.Handle, moduleBase);
@@ -208,10 +221,29 @@ namespace FishingAutoCatch
                                 Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {msg}");
                                 Log.Write(msg);
                             }
+                            // 入口计数变化（v1.0.2 诊断）：>0 表示游戏确实执行到对应 Hook 点入口
+                            if (state.Value.entryA != lastEntryA && lastEntryA != -1 && state.Value.entryA > 0)
+                            {
+                                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] 入口 A（0x38A860 节奏判定）已执行 {state.Value.entryA} 次");
+                                Log.Write($"入口 A 已执行 {state.Value.entryA} 次");
+                            }
+                            if (state.Value.entryC != lastEntryC && lastEntryC != -1 && state.Value.entryC > 0)
+                            {
+                                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] 入口 C（0x216C9C 续竿/重甩）已执行 {state.Value.entryC} 次");
+                                Log.Write($"入口 C 已执行 {state.Value.entryC} 次");
+                            }
+                            if (state.Value.entryD != lastEntryD && lastEntryD != -1 && state.Value.entryD > 0)
+                            {
+                                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] 入口 D（0x216B46 入包/背包满）已执行 {state.Value.entryD} 次");
+                                Log.Write($"入口 D 已执行 {state.Value.entryD} 次");
+                            }
                             lastEnabled = state.Value.enabled;
                             lastHits = state.Value.hits;
                             lastFishCount = state.Value.fishCount;
                             lastBagFull = state.Value.bagFull;
+                            lastEntryA = state.Value.entryA;
+                            lastEntryC = state.Value.entryC;
+                            lastEntryD = state.Value.entryD;
 
                             // Hook B 自愈：确保其字节与 gEnabled 一致（防 F8 切换丢失/二进制被外部覆盖）
                             try

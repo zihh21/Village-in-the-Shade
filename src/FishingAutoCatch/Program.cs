@@ -19,7 +19,7 @@ namespace FishingAutoCatch
     internal static class Program
     {
         /// <summary>与 version.txt 同步维护。</summary>
-        public const string Version = "1.0.1";
+        public const string Version = "1.0.2";
 
         private static int Main(string[] args)
         {

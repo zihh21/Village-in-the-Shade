@@ -60,8 +60,10 @@ namespace FishingAutoCatch
             byte[] code = HookStub.Build(stubBase, targetA);
             if (!WriteAt(hProcess, stubBase, code))
                 return "写入 stub 代码失败。";
-            // gEnabled=1(默认开启), gHits=0, gBagFull=0, gFishCount=0
-            byte[] flags = { 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+            // gEnabled=1(默认开启), gHits=0, gBagFull=0, gFishCount=0, gEntryA/C/D=0
+            byte[] flags = { 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                             0x00, 0x00 };
             if (!WriteAt(hProcess, stubBase + HookStub.FlagEnabledOffset, flags))
                 return "写入状态字节失败。";
 
@@ -234,12 +236,15 @@ namespace FishingAutoCatch
             if (!IsOurPatch(curD, stubBase + HookStub.BagStubOffset))
                 return "Hook 点 D detour 未指向入包 stub 区（可能仍是 v1.0.0 错误补丁），需重新注入。";
 
-            var st = new byte[10];
+            var st = new byte[22];
             if (!ReadAt(hProcess, stubBase + HookStub.FlagEnabledOffset, st)) return "读取 stub 状态失败。";
             int enabled = st[0];
             int hits = BitConverter.ToInt32(st, 1);
             int bagFull = st[5];
             int fishCount = BitConverter.ToInt32(st, 6);
+            int entryA = BitConverter.ToInt32(st, 10);
+            int entryC = BitConverter.ToInt32(st, 14);
+            int entryD = BitConverter.ToInt32(st, 18);
 
             // Hook B 必须与 gEnabled 一致：开启→NOP（跳过成功检查），关闭→原始 je（等待时间线播完）
             var curB = new byte[HookStub.SuccessPatchLength];
@@ -251,7 +256,8 @@ namespace FishingAutoCatch
                 return $"Hook B 与开关状态不一致（当前开关={enabled}）。请用监控窗口按 F8 同步或重新注入。";
 
             return $"Hook A/B/C/D 均在位且与开关一致。开关={enabled}（1=开），" +
-                   $"自动判定累计触发 {hits} 次，本次已钓 {fishCount} 条，背包满={bagFull}。";
+                   $"自动判定累计触发 {hits} 次，本次已钓 {fishCount} 条，背包满={bagFull}，" +
+                   $"入口计数 A={entryA} C={entryC} D={entryD}（>0 表示游戏确实执行到对应 Hook 点）。";
         }
 
         /// <summary>
@@ -280,14 +286,37 @@ namespace FishingAutoCatch
                            : "Hook B → 原版 je（恢复等待时间线播完，手动玩法生效）";
         }
 
-        /// <summary>供监控模式读取实时开关与计数；模块基址与记录不符（游戏重启）时返回 null。</summary>
-        public static (int enabled, int hits, int bagFull, int fishCount)? ReadLiveState(IntPtr hProcess, long moduleBase)
+        /// <summary>供监控模式读取实时开关与计数（含 v1.0.2 入口计数）；模块基址与记录不符（游戏重启）时返回 null。</summary>
+        public static (int enabled, int hits, int bagFull, int fishCount,
+                       int entryA, int entryC, int entryD)? ReadLiveState(IntPtr hProcess, long moduleBase)
         {
             if (!PatchState.TryLoad(out var m, out var stubBase, out _, out _, out _, out _)) return null;
             if (m != moduleBase) return null;
-            var st = new byte[10];
+            var st = new byte[22];
             if (!ReadAt(hProcess, stubBase + HookStub.FlagEnabledOffset, st)) return null;
-            return (st[0], BitConverter.ToInt32(st, 1), st[5], BitConverter.ToInt32(st, 6));
+            return (st[0], BitConverter.ToInt32(st, 1), st[5], BitConverter.ToInt32(st, 6),
+                    BitConverter.ToInt32(st, 10), BitConverter.ToInt32(st, 14), BitConverter.ToInt32(st, 18));
+        }
+
+        /// <summary>读取四个 Hook 点当前字节（十六进制），用于注入/自检的关键字节比对日志。</summary>
+        public static string DumpHookBytes(IntPtr hProcess, long moduleBase)
+        {
+            long targetA = moduleBase + HookStub.HookRva;
+            long targetB = moduleBase + HookStub.SuccessRva;
+            long targetC = moduleBase + HookStub.CastRva;
+            long targetD = moduleBase + HookStub.BagRva;
+
+            var a = new byte[HookStub.PatchLength];
+            if (!ReadAt(hProcess, targetA, a)) return "读取 Hook 点 A 失败。";
+            var b = new byte[HookStub.SuccessPatchLength];
+            if (!ReadAt(hProcess, targetB, b)) return "读取 Hook 点 B 失败。";
+            var c = new byte[HookStub.CastPatchLength];
+            if (!ReadAt(hProcess, targetC, c)) return "读取 Hook 点 C 失败。";
+            var d = new byte[HookStub.BagPatchLength];
+            if (!ReadAt(hProcess, targetD, d)) return "读取 Hook 点 D 失败。";
+
+            return "A=" + Convert.ToHexString(a) + " | B=" + Convert.ToHexString(b) +
+                   " | C=" + Convert.ToHexString(c) + " | D=" + Convert.ToHexString(d);
         }
 
         // ---------------- 内部工具 ----------------

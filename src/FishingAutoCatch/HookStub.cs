@@ -93,7 +93,7 @@ namespace FishingAutoCatch
         public const int CastStubOffset = 176;
         /// <summary>入包 stub 起点（续竿 stub 结束后向 16 对齐，预留 192 字节空间）。</summary>
         public const int BagStubOffset = 368;
-        /// <summary>状态区起点：gEnabled(1B) + gHits(4B) + gBagFull(1B) + gFishCount(4B)。</summary>
+        /// <summary>状态区起点：gEnabled(1B) + gHits(4B) + gBagFull(1B) + gFishCount(4B) + 三口入口计数(4B×3)。</summary>
         public const int FlagsOffset = 560;
         /// <summary>gEnabled：自动模式总开关（F8）。</summary>
         public const int FlagEnabledOffset = FlagsOffset + 0;
@@ -103,7 +103,13 @@ namespace FishingAutoCatch
         public const int FlagBagFullOffset = FlagsOffset + 5;
         /// <summary>gFishCount(dword)：本次自动循环成功入包条数。</summary>
         public const int FlagFishCountOffset = FlagsOffset + 6;
-        /// <summary>总缓冲区：Hook A(≤176) + Hook C(≤192) + Hook D(≤192) + Flags(10+)。</summary>
+        /// <summary>gEntryA(dword)：Hook A（0x38A860）入口被执行次数（无条件计数，v1.0.2 诊断用）。</summary>
+        public const int FlagEntryAOffset = FlagsOffset + 10;
+        /// <summary>gEntryC(dword)：Hook C（0x216C9C）入口被执行次数（无条件计数，v1.0.2 诊断用）。</summary>
+        public const int FlagEntryCOffset = FlagsOffset + 14;
+        /// <summary>gEntryD(dword)：Hook D（0x216B46）入口被执行次数（无条件计数，v1.0.2 诊断用）。</summary>
+        public const int FlagEntryDOffset = FlagsOffset + 18;
+        /// <summary>总缓冲区：Hook A(≤176) + Hook C(≤192) + Hook D(≤192) + Flags(22)。</summary>
         public const int StubBufferSize = 640;
 
         /// <summary>
@@ -133,6 +139,10 @@ namespace FishingAutoCatch
         {
             long resume = moduleBase + HookRva + PatchLength;   // 跳回 0x...A86F（push rbp 处）
             var em = new Emitter();
+
+            // ---- 0) 无条件入口计数（v1.0.2 诊断）：无论开关状态，只要游戏执行到 0x38A860 就 +1 ----
+            //       用于判定"游戏是否真的到达节奏判定函数"（此前用户反馈全失效，需客观区分 未执行/守卫不过/开关未开）。
+            em.EmitEntryInc(0, FlagEntryAOffset);               // inc dword [rip+disp32] ← gEntryA
 
             // ---- 1) 开关检查：关闭 → 直接走原逻辑 ----
             em.MovAbsRax(flagEnabled);                         // movabs rax, &gEnabled
@@ -233,6 +243,24 @@ namespace FishingAutoCatch
             public void MovAbsRax(long v) => EmitMovAbs(0x48, 0xB8, v);
             public void MovAbsRdx(long v) => EmitMovAbs(0x48, 0xBA, v);
             public void MovAbsR11(long v) => EmitMovAbs(0x49, 0xBB, v);
+
+            /// <summary>
+            /// inc dword [rip+disp32]（6 字节 `FF 05` + disp32）：无条件递增入口计数 flag。
+            /// disp32 通过"本条指令在 stub 缓冲区内的绝对偏移"计算，不占用 64 位立即数槽。
+            /// </summary>
+            /// <param name="bufferOffset">本 stub 在缓冲区内的起始偏移（Hook A=0 / C=CastStubOffset / D=BagStubOffset）。</param>
+            /// <param name="targetStubOffset">目标 flag 在缓冲区内的偏移（如 FlagEntryAOffset）。</param>
+            public void EmitEntryInc(int bufferOffset, int targetStubOffset)
+            {
+                int thisAbs = bufferOffset + _b.Count;        // 本条指令起点在缓冲区的位置
+                int disp = targetStubOffset - (thisAbs + 6); // FF 05 disp32 指令长 6，disp 相对下一条
+                _b.Add(0xFF);
+                _b.Add(0x05);
+                _b.Add((byte)disp);
+                _b.Add((byte)(disp >> 8));
+                _b.Add((byte)(disp >> 16));
+                _b.Add((byte)(disp >> 24));
+            }
 
             private void EmitMovAbs(int rex, int op, long v)
             {

@@ -4,7 +4,7 @@
 
 ## 当前包含的 Mod
 
-### 1. FishingAutoCatch 自动钓鱼 `v1.0.1`
+### 1. FishingAutoCatch 自动钓鱼 `v1.0.2`
 
 | 项目 | 内容 |
 |---|---|
@@ -58,9 +58,41 @@
   `CastHookStub.cs`（Hook C/D 机器码生成）、`ProcessManager.cs`（定位进程）、`PatchState.cs`（注入状态持久化，含四补丁原始字节）、
   `Win32Api.cs`（P/Invoke）、`Log.cs`（日志）。
 - 辅助脚本：`scripts/dump_hook_bytes.py`（按 RVA dump village.exe 覆盖段原始字节）、
-  `scripts/verify_stub_v100.py`（stub 结构校验）。
+  `scripts/verify_stub_v100.py`（stub 结构校验，已随 v1.0.2 更新：验证三口入口计数 `FF 05` 与复放段新偏移）、
+  `scripts/probe_v102.ps1`（实机内存探针：OpenProcess+ReadProcessMemory 读取四 Hook 与 stub 字节）。
 
 ## 更新记录
+
+### 2026-09-24（v1.0.2：用户反馈"开启后仍无效"——新增入口计数与关键步骤日志，客观定位根因）
+
+- **背景**：v1.0.1 修复 C/D detour 指向后，用户反馈"还是跟之前一样：开启后钓鱼无任何效果，
+  连原来跳过小游戏也没有，请修复并在关键步骤增加日志"。实机探针确认四个 Hook 的 detour 与 stub
+  字节全部正确（A→stubBase、C→stubBase+0xB0、D→stubBase+0x170，movabs 地址与 resume 槽全对），
+  但 `gEnabled=0`（F8 关闭态）、`gHits=0`，且 v1.0.x 时代从未出现过"自动判定已触发 N 次"日志。
+  **无法区分**"游戏根本没执行到 0x38A860" / "stub 守卫条件不满足" / "用户测试时开关未开"三种可能。
+- **新增（诊断）**：三个 Hook stub（A=0x38A860、C=0x216C9C、D=0x216B46）入口各增加 **6 字节无条件
+  入口计数指令** `FF 05 disp32`（inc dword[rip+disp32]，指向 flags 区新增 gEntryA/gEntryC/gEntryD）：
+  只要游戏执行到对应 Hook 点入口就 +1，与开关状态无关。配合 gHits（自动判定触发）、gFishCount（已钓）、
+  gBagFull（背包满），一次性判定根因：
+  - 入口 A 不增长 → 游戏根本没执行到节奏判定函数（小游戏未启动 / 铺码错位）；
+  - 入口 A 增长但 gHits 不增长 → stub 守卫（对象布局/字符串判定）不过；
+  - 入口 A 增长且 gHits 增长但 C/D 无动作 → 续竿/入包路径问题。
+- **新增（关键步骤日志）**：
+  - 注入完成后立即**回读四个 Hook 点真实字节**打印并写日志（`注入回读 A=… B=… C=… D=…`），供比对 patch 是否到位；
+  - 注入后逐点 Verify（含四 Hook 在位、Hook B 与开关一致、开关状态 + 两条计数 + 三口入口计数）；
+  - 监控轮询新增输出与日志：入口 A/C/D 执行次数变化（>0 即"游戏确实执行到对应 Hook 点"）；
+  - F8 切换与 Hook B 同步事件日志保持。
+- **调整**：`Verify` / `ReadLiveState` 读取 22 字节状态区（gEnabled+gHits+gBagFull+gFishCount+gEntryA/C/D）；
+  flags 布局：560 gEnabled(1B) / 561 gHits(4B) / 565 gBagFull(1B) / 566 gFishCount(4B) /
+  570 gEntryA(4B) / 574 gEntryC(4B) / 578 gEntryD(4B)；stub 总长仍 640。
+- **脚本**：`verify_stub_v100.py` 同步更新——Hook C movsd 复放段偏移 176→182、Hook D 复放段
+  368+13→368+6+13，并新增三处 `FF 05` 入口计数存在性检查；capstone 校验通过（resume 槽全部正确）。
+- **验证**：`dotnet build -c Release` 0 警告 0 错误；`--dump-stub` → capstone 逐指令校验通过；
+  实机注入（游戏 PID 24924, moduleBase 0x7FF66AA00000）后探针确认四 detour 指向正确、
+  三口入口计数指令在位（FF 05 34 02 00 00 / 88 01 00 00 / CC 00 00 00，disp32 指向 570/574/578）、
+  Hook B=NOP（当前开启）。
+- **待用户确认**：在 F8 开启状态（当前默认开启）下实际钓鱼一次，观察监控窗口是否出现
+  "入口 A 已执行 N 次"与"自动判定已触发 N 次"，即可依据上述判据最终定位 v1.0.x 失效根因并修复。
 
 ### 2026-09-24（v1.0.1：修复 Hook C/D detour 误指向导致自动钓鱼完全失效）
 
