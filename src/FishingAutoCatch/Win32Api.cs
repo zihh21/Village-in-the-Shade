@@ -40,29 +40,16 @@ namespace FishingAutoCatch
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool CloseHandle(IntPtr handle);
 
-        [DllImport("kernel32.dll", CharSet = CharSet.Ansi, SetLastError = true)]
-        private static extern IntPtr GetModuleHandleA(string moduleName);
-
-        [DllImport("kernel32.dll", CharSet = CharSet.Ansi, SetLastError = true)]
-        private static extern IntPtr GetProcAddress(IntPtr module, string procName);
-
         /// <summary>
-        /// 解析 user32!GetAsyncKeyState 地址。
-        /// 系统 DLL 在各进程中的加载基址一致，可直接在加载器侧解析后供 stub 使用。
+        /// 加载器侧全局按键状态查询（任何进程调用都反映全局键盘状态）。
+        /// 返回值最高位为 1 表示该键当前被按下。F8 热键检测由加载器完成，
+        /// 不再依赖游戏进程内的 GetAsyncKeyState（见 HookStub 头注释）。
         /// </summary>
-        public static long GetAsyncKeyStateAddress()
-        {
-            IntPtr mod = GetModuleHandleA("user32.dll");
-            if (mod == IntPtr.Zero) return 0;
-            return GetProcAddress(mod, "GetAsyncKeyState").ToInt64();
-        }
+        [DllImport("user32.dll")]
+        public static extern short GetAsyncKeyState(int vKey);
 
-        /// <summary>解析 kernel32!Beep 地址（F8 切换提示音，stub 内调用）。</summary>
-        public static long BeepAddress()
-        {
-            IntPtr mod = GetModuleHandleA("kernel32.dll");
-            if (mod == IntPtr.Zero) return 0;
-            return GetProcAddress(mod, "Beep").ToInt64();
-        }
+        /// <summary>加载器侧提示音（F8 切换时发声，与游戏进程解耦）。</summary>
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool Beep(uint dwFreq, uint dwDuration);
     }
 }

@@ -19,7 +19,7 @@ namespace FishingAutoCatch
     internal static class Program
     {
         /// <summary>与 version.txt 同步维护。</summary>
-        public const string Version = "0.2.0";
+        public const string Version = "0.3.0";
 
         private static int Main(string[] args)
         {
@@ -106,8 +106,8 @@ namespace FishingAutoCatch
 
                         case "--status":
                             int state = Injector.ReadEnabledState(handle.Handle);
-                            Console.WriteLine(state == 1 ? "钓鱼自动收杆：开启（游戏中按 F8 切换，开启 880Hz/关闭 440Hz 提示音）"
-                                    : state == 0 ? "钓鱼自动收杆：关闭（游戏中按 F8 切换）"
+                            Console.WriteLine(state == 1 ? "钓鱼自动收杆：开启（保持监控窗口运行，任意场景按 F8 切换，开启 880Hz/关闭 440Hz 提示音）"
+                                    : state == 0 ? "钓鱼自动收杆：关闭（保持监控窗口运行，任意场景按 F8 切换）"
                                     : "未注入或状态文件缺失。");
                             return 0;
 
@@ -161,7 +161,8 @@ namespace FishingAutoCatch
             Console.WriteLine("  FishingAutoCatch --remove   还原被 Hook 的原始代码");
             Console.WriteLine("  FishingAutoCatch --dump-stub [路径]  输出 stub 机器码用于反汇编验证");
             Console.WriteLine();
-            Console.WriteLine("游戏内热键：F8 开启/关闭（开启发出 880Hz 提示音，关闭发出 440Hz 提示音）。");
+            Console.WriteLine("全局热键：F8 开启/关闭（开启发出 880Hz 提示音，关闭发出 440Hz 提示音）；");
+            Console.WriteLine("          由本程序监控窗口检测，任意界面/场景下均有效，需保持监控窗口运行。");
         }
     }
 
