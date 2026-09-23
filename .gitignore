@@ -1,0 +1,27 @@
+# ===== 游戏本体与数据（不得提交） =====
+village.exe
+*.dll
+*.exe
+*.dat
+data/
+steam_settings/
+*.bak
+
+# ===== 反编译产物与工具链 =====
+Decompiled/
+.tools/
+D:\code\.tools/
+
+# ===== 构建产物与缓存 =====
+src/**/bin/
+src/**/obj/
+.vs/
+*.user
+*.suo
+Mods/
+
+# ===== 运行期生成物 =====
+*.log
+*.bin
+*.tmp
+FishingAutoCatch.original.bin
