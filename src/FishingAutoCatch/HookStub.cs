@@ -4,7 +4,7 @@ using System.Collections.Generic;
 namespace FishingAutoCatch
 {
     /// <summary>
-    /// 钓鱼自动收杆（跳过"鱼上钩拉线节奏小游戏"）的核心 Hook 机器码生成器。
+    /// 钓鱼自动循环（FishingAutoCatch v1.0.0）的核心 Hook 机器码生成器。
     ///
     /// 反编译依据（village.exe，ImageBase 0x140000000）：
     ///   Hook 点 A：rva 0x38A860 = CTask_Menu_Fishing::update 节奏判定入口（经 0x388DD0 stub 被任务 ctor 0x388B30 注册）。
@@ -25,11 +25,28 @@ namespace FishingAutoCatch
     ///     （置完成标志 → 全音符==2 检查 → 0x38B343 发成功事件 rva 0xE354E0 + 消息 0xFB），
     ///     仍与手动通关同一条正规结算路径。
     ///
+    ///   Hook 点 C（续竿 / 自动重甩）：rva 0x216C9C 起 26 字节，属于玩家主状态机"钓鱼状态"（玩家对象 r14，
+    ///     +0x1DC 为目标状态、+0x238 任务指针、+0x240 输入对象、+0x2A8 浮标位置 float）。
+    ///     state5（0x216BFB 收竿动画）动画播完走到 0x216C9C-0x216CB5：
+    ///       movsd xmm0,[rsp+0x50]（6B）→ movsd [r14+0x2A8],xmm0（9B，含 REX.B 前缀 0x41）→
+    ///       mov [r14+0x1DC],1（11B）=26B，
+    ///     原版写 1 回 state1（等待/继续等咬钩）。自动模式下改写 0 回 state0 重新甩竿（刷新浮标位置），
+    ///     同时覆盖"state2 等咬钩超时 → [1DC]=5 → state5 收竿动画 → 续竿点"的超时重甩路径，无需单独 hook 0x215E0A。
+    ///     判定：gEnabled==0 或 gBagFull==1 → 写 1 走原版（F8 关闭 / 背包已满，等玩家手动收杆清包）；
+    ///     否则写 0 自动续竿重甩。收杆键由 state1 原版检测（0x497 → [1DC]=7 手动收杆自然停止），stub 内不查键。
+    ///
+    ///   Hook 点 D（背包满检测 / 入包计数）：rva 0x216B46 起 45 字节（state4 结算入包调用点，两路汇合 0x216A73 jmp 0x216B46）：
+    ///     mov rax,[rip+0xEC8F83]（全局单例 0x10DFAD0 内容）+ mov rcx,[rax+0x208] + mov byte [rsp+0x20],1 +
+    ///     xor r9d,r9d + mov edx,0x41A + mov r8d,6 + mov rcx,[rcx+0x32B8]（背包容器）+ call 0x138BC0（持有物添加，resume 0x216B73 mov rax,[r13]）。
+    ///     0x138BC0 内部容量判定（0x138DF5-0x138E13）：满时 clamp 后发消息 0x3EB（通用"无法持有/已满"）并 xor al,al 返回 0，
+    ///     正常路径（0x138ED3→0x1390C2）mov al,1。stub 复放调用后读 al：
+    ///     al==0 且自动模式 → gBagFull=1（停续竿）；al==1 → gFishCount++ 且 gBagFull=0（清包后自动恢复）。
+    ///
     /// 热键说明（v0.3.0 起）：F8 不再由 stub 轮询（原方案存在 call Beep 破坏 rax 的缺陷），
     /// 改由加载器（监控进程）内 GetAsyncKeyState(VK_F8) 轮询——该 API 在任何进程都反映全局键盘状态，
     /// 因此任意时刻（含非钓鱼场景）都能切换开关，切换时加载器侧 Beep 发声提示。
     ///
-    /// 诊断：每次真正执行"自动判定"时递增 gHits 计数（供加载器显示，便于确认 Hook 生效）。
+    /// 诊断：每次真正执行"自动判定"时递增 gHits 计数；每成功入包一次递增 gFishCount（供加载器显示"本次已钓 N 条"）。
     /// </summary>
     internal static class HookStub
     {
@@ -45,24 +62,77 @@ namespace FishingAutoCatch
         /// <summary>0F 84 81 01 00 00 → 6×0x90（跳过 0x7491b0 结果，无条件进入成功动作）。</summary>
         public static readonly byte[] SuccessPatch = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
 
-        // ---------------- 注入缓冲区布局（代码 164 + 状态字节） ----------------
-        /// <summary>gEnabled：开关（加载器侧 F8 翻转）。</summary>
-        public const int FlagEnabledOffset = 164;
+        // ---------------- Hook 点 C：续竿 / 自动重甩（v1.0.0 新增） ----------------
+        /// <summary>
+        /// Hook 点 C：state5 收竿动画完成点（resume 0x216CB6，覆盖 0x216C9C..0x216CB5 = 26 字节）：
+        ///   0x216C9C movsd xmm0,[rsp+0x50]（6B，F2 0F 10 44 24 50）
+        ///   0x216CA2 movsd [r14+0x2A8],xmm0（9B，41 F2 0F 11 86 A8 02 00 00，REX.B 前缀 0x41 针对 r14）
+        ///   0x216CAB mov dword [r14+0x1DC],1（11B，41 C7 86 DC 01 00 00 01 00 00 00）
+        ///   0x216CB6 resume：cmp qword [r14+0x238],rbx
+        /// </summary>
+        public const long CastRva = 0x216C9CL;
+        public const int CastPatchLength = 26;
+        public const long CastResumeRva = 0x216CB6L;
+
+        // ---------------- Hook 点 D：背包满检测 / 入包计数（v1.0.0 新增） ----------------
+        /// <summary>Hook 点 D：入包调用点（state4 结算，45 字节，resume 0x216B73）。</summary>
+        public const long BagRva = 0x216B46L;
+        public const int BagPatchLength = 45;
+        public const long BagResumeRva = 0x216B73L;
+        /// <summary>持有物添加函数（容量判定，返回 al=0 满 / al=1 成功）。</summary>
+        public const long AddHoldRva = 0x138BC0L;
+        /// <summary>输入查询：rcx=输入对象、edx=键ID、r8=查询结构；返回 al=1 激活/按下。</summary>
+        public const long InputQueryRva = 0x7EF810L;
+        /// <summary>收杆键键值（state1 原版检测 0x497 → [1DC]=7 手动收杆）。</summary>
+        public const int CastKeyId = 0x497;
+        /// <summary>全局单例（内容为持有物/关系容器，+0x208 持有物容器、+0x208+0x32B8 背包容器）。</summary>
+        public const long GlobalRva = 0x10DFAD0L;
+
+        // ---------------- 注入缓冲区布局（代码区 + 查询结构区 + 状态字节） ----------------
+        /// <summary>续竿 stub 起点（Hook A 区结束后向 16 对齐）。</summary>
+        public const int CastStubOffset = 176;
+        /// <summary>入包 stub 起点（续竿 stub 结束后向 16 对齐，预留 192 字节空间）。</summary>
+        public const int BagStubOffset = 368;
+        /// <summary>状态区起点：gEnabled(1B) + gHits(4B) + gBagFull(1B) + gFishCount(4B)。</summary>
+        public const int FlagsOffset = 560;
+        /// <summary>gEnabled：自动模式总开关（F8）。</summary>
+        public const int FlagEnabledOffset = FlagsOffset + 0;
         /// <summary>gHits(dword)：自动判定累计触发次数（诊断）。</summary>
-        public const int FlagHitsOffset = 165;
-        public const int StubBufferSize = 170;
+        public const int FlagHitsOffset = FlagsOffset + 1;
+        /// <summary>gBagFull(byte)：游戏真实背包已满（0x138BC0 返回 0 时置位，入包成功清 0）。</summary>
+        public const int FlagBagFullOffset = FlagsOffset + 5;
+        /// <summary>gFishCount(dword)：本次自动循环成功入包条数。</summary>
+        public const int FlagFishCountOffset = FlagsOffset + 6;
+        /// <summary>总缓冲区：Hook A(≤176) + Hook C(≤192) + Hook D(≤192) + Flags(10+)。</summary>
+        public const int StubBufferSize = 640;
 
         /// <summary>
-        /// 生成完整 stub 代码（跳转与 64 位立即数已回填）。
+        /// 生成完整 stub 缓冲区（跳转与 64 位立即数已回填）。
+        /// 布局：[0,176)  Hook A 节奏判定 → [176,368) Hook C 续竿/重甩 → [368,560) Hook D 入包/背包满 → [560,640) 状态区。
+        /// 状态区固定偏移由注入器初始化（gEnabled/gHits/gBagFull/gFishCount）。
         /// </summary>
         /// <param name="stubBase">注入缓冲区在目标进程内的基址。</param>
-        /// <param name="target">Hook 目标函数地址（模块基址 + HookRva）。</param>
+        /// <param name="target">Hook A 目标函数地址（模块基址 + HookRva）。</param>
         public static byte[] Build(long stubBase, long target)
         {
-            var em = new Emitter();
-            long resume = target + PatchLength;               // 跳回 0x...A86F（push rbp 处）
+            long moduleBase = target - HookRva;
+            var buf = new byte[StubBufferSize];
             long flagEnabled = stubBase + FlagEnabledOffset;
             long flagHits = stubBase + FlagHitsOffset;
+            long flagBagFull = stubBase + FlagBagFullOffset;
+            long flagFishCount = stubBase + FlagFishCountOffset;
+
+            BuildHookA(buf, moduleBase, flagEnabled, flagHits);
+            CastHookStub.BuildCast(buf, CastStubOffset, moduleBase, flagEnabled, flagBagFull);
+            CastHookStub.BuildBag(buf, BagStubOffset, moduleBase, flagEnabled, flagBagFull, flagFishCount);
+            return buf;
+        }
+
+        /// <summary>Hook A：节奏小游戏自动判定 stub，写入 buf[0, CastStubOffset)。</summary>
+        private static void BuildHookA(byte[] buf, long moduleBase, long flagEnabled, long flagHits)
+        {
+            long resume = moduleBase + HookRva + PatchLength;   // 跳回 0x...A86F（push rbp 处）
+            var em = new Emitter();
 
             // ---- 1) 开关检查：关闭 → 直接走原逻辑 ----
             em.MovAbsRax(flagEnabled);                         // movabs rax, &gEnabled
@@ -125,16 +195,16 @@ namespace FishingAutoCatch
             WriteImm(code, slots[0], (ulong)flagEnabled);
             WriteImm(code, slots[1], (ulong)flagHits);
             WriteImm(code, resumeSlot, (ulong)resume);
-            return code;
+            Array.Copy(code, 0, buf, 0, code.Length);
         }
 
-        private static void WriteImm(byte[] code, int pos, ulong v)
+        internal static void WriteImm(byte[] code, int pos, ulong v)
         {
             for (int i = 0; i < 8; i++) code[pos + i] = (byte)(v >> (8 * i));
         }
 
         /// <summary>极小 x64 汇编发射器：支持本 stub 所需指令与标签/跳转回填。</summary>
-        private sealed class Emitter
+        internal sealed class Emitter
         {
             private readonly List<byte> _b = new List<byte>();
             private readonly Dictionary<string, int> _labels = new Dictionary<string, int>();

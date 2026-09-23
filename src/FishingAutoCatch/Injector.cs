@@ -3,7 +3,7 @@ using System;
 namespace FishingAutoCatch
 {
     /// <summary>
-    /// 注入器：向目标进程分配内存写入 stub，并打两个 16 进制 patch：
+    /// 注入器：向目标进程分配内存写入 stub，并打四个 16 进制 patch：
     ///   Hook 点 A：0x38A860（CTask_Menu_Fishing::update 入口，15 字节）
     ///     覆盖字节（HookStub.PatchLength=15）：mov rax,rsp / mov[rax+10],rbx / mov[rax+18],rsi / mov[rax+20],rdi，
     ///     替换为 `FF 25 00000000 <stub基址8字节> 90`（jmp qword[rip+0] → stub）。
@@ -11,12 +11,16 @@ namespace FishingAutoCatch
     ///   Hook 点 B：0x38B2FD（成功检查 je 0x38B484，6 字节）
     ///     `0F 84 81 01 00 00` → 6×NOP。0x38B2F6 调用 0x7491b0（时间轴播完判定）返回 0 时会
     ///     跳到 0x38B484 退出本帧，导致"伪造音符全命中仍卡在小游戏"；NOP 后音符达标即无条件走成功动作。
+    ///   Hook 点 C：0x216C9C（state5 收竿动画完成续竿点，26 字节，resume 0x216CB6）
+    ///     自动模式下改写 [r14+0x1DC]=0 回 state0 重新甩竿（含超时重甩）；否则写 1 走原版。
+    ///   Hook 点 D：0x216B46（state4 入包调用点，45 字节，resume 0x216B73）
+    ///     stub 复放 call 0x138BC0 后按返回值 al 更新 gBagFull / gFishCount（背包满检测 + 已钓计数）。
     ///
-    /// 状态字节（stub 缓冲区尾部，由注入器写入）：gEnabled(1B) + gHits(4B)。
+    /// 状态字节（stub 缓冲区尾部，由注入器写入）：gEnabled(1B) + gHits(4B) + gBagFull(1B) + gFishCount(4B)。
     /// </summary>
     internal static class Injector
     {
-        /// <summary>Hook A patch 头部：jmp [rip+0]（6 字节）＋8 字节绝对地址＋1 字节填充。</summary>
+        /// <summary>detour 头部：jmp qword[rip+0]（6 字节）＋8 字节绝对地址。</summary>
         private static readonly byte[] Signature = { 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00 };
 
         // ---------------- 安装 ----------------
@@ -24,17 +28,25 @@ namespace FishingAutoCatch
         {
             long targetA = moduleBase + HookStub.HookRva;
             long targetB = moduleBase + HookStub.SuccessRva;
+            long targetC = moduleBase + HookStub.CastRva;
+            long targetD = moduleBase + HookStub.BagRva;
 
             // 0) 防重复注入：若是本工具上次打的补丁，先还原为原始字节再重打
-            RestoreIfDoubleInject(hProcess, moduleBase, targetA, targetB);
+            RestoreIfDoubleInject(hProcess, moduleBase, targetA, targetB, targetC, targetD);
 
-            // 1) 读取两处被覆盖前的原始字节（用于状态文件/还原）
+            // 1) 读取四处被覆盖前的原始字节（用于状态文件/还原）
             var originalA = new byte[HookStub.PatchLength];
             if (!ReadAt(hProcess, targetA, originalA))
                 return "读取 Hook 点 A 原始字节失败（句柄权限不足？）。";
             var originalB = new byte[HookStub.SuccessPatchLength];
             if (!ReadAt(hProcess, targetB, originalB))
                 return "读取 Hook 点 B 原始字节失败（句柄权限不足？）。";
+            var originalC = new byte[HookStub.CastPatchLength];
+            if (!ReadAt(hProcess, targetC, originalC))
+                return "读取 Hook 点 C 原始字节失败（句柄权限不足？）。";
+            var originalD = new byte[HookStub.BagPatchLength];
+            if (!ReadAt(hProcess, targetD, originalD))
+                return "读取 Hook 点 D 原始字节失败（句柄权限不足？）。";
 
             // 2) 在目标进程分配可执行内存
             IntPtr stubBasePtr = Win32Api.VirtualAllocEx(hProcess, IntPtr.Zero,
@@ -48,35 +60,40 @@ namespace FishingAutoCatch
             byte[] code = HookStub.Build(stubBase, targetA);
             if (!WriteAt(hProcess, stubBase, code))
                 return "写入 stub 代码失败。";
-            byte[] flags = { 0x01, 0x00, 0x00, 0x00, 0x00 }; // gEnabled=1(默认开启), gHits=0
+            // gEnabled=1(默认开启), gHits=0, gBagFull=0, gFishCount=0
+            byte[] flags = { 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
             if (!WriteAt(hProcess, stubBase + HookStub.FlagEnabledOffset, flags))
                 return "写入状态字节失败。";
 
-            // 4) Hook A：入口 detour
-            var patch = new byte[HookStub.PatchLength];
-            Array.Copy(Signature, patch, Signature.Length);
-            for (int i = 0; i < 8; i++) patch[6 + i] = (byte)((ulong)stubBase >> (8 * i));
-            patch[14] = 0x90; // 填充（0x...A86E，原 prologue 末尾一字节）
-            if (!ProtectWriteVerify(hProcess, targetA, patch))
+            // 4) 四个 Hook 点 detour / NOP
+            if (!ProtectWriteVerify(hProcess, targetA, BuildDetourPatch(stubBase, HookStub.PatchLength)))
                 return "写入 detour（Hook A）失败或校验不一致。";
-
-            // 5) Hook B：成功检查 je → NOP（跳过 0x7491b0 结果，无条件走成功动作）
             if (!ProtectWriteVerify(hProcess, targetB, HookStub.SuccessPatch))
                 return "写入成功检查补丁（Hook B）失败或校验不一致。";
+            if (!ProtectWriteVerify(hProcess, targetC, BuildDetourPatch(stubBase, HookStub.CastPatchLength)))
+                return "写入 detour（Hook C）失败或校验不一致。";
+            if (!ProtectWriteVerify(hProcess, targetD, BuildDetourPatch(stubBase, HookStub.BagPatchLength)))
+                return "写入 detour（Hook D）失败或校验不一致。";
 
-            // 6) 记录状态并返回
-            PatchState.Save(moduleBase, stubBase, originalA, originalB);
+            // 5) 记录状态并返回
+            PatchState.Save(moduleBase, stubBase, originalA, originalB, originalC, originalD);
             return $"注入成功。\n" +
                    $"  Hook A    : 0x{targetA:X}（入口 detour）\n" +
                    $"  Hook B    : 0x{targetB:X}（成功检查跳过）\n" +
+                   $"  Hook C    : 0x{targetC:X}（续竿/自动重甩）\n" +
+                   $"  Hook D    : 0x{targetD:X}（入包/背包满检测）\n" +
                    $"  Stub 基址 : 0x{stubBase:X}\n" +
                    $"  默认开关  : 开启（加载器按 F8 切换，开启 880Hz/关闭 440Hz 提示音）";
         }
 
-        /// <summary>若两个 Hook 点当前正是本模块上次写入的内容，则先还原原始字节并释放旧 stub，再让 Install 重打。</summary>
-        private static void RestoreIfDoubleInject(IntPtr hProcess, long moduleBase, long targetA, long targetB)
+        /// <summary>
+        /// 若四个 Hook 点当前正是本模块上次写入的内容，则先还原原始字节并释放旧 stub，再让 Install 重打。
+        /// </summary>
+        private static void RestoreIfDoubleInject(IntPtr hProcess, long moduleBase,
+            long targetA, long targetB, long targetC, long targetD)
         {
-            if (!PatchState.TryLoad(out var m, out var stubBase, out var originalA, out var originalB)) return;
+            if (!PatchState.TryLoad(out var m, out var stubBase,
+                    out var originalA, out var originalB, out var originalC, out var originalD)) return;
             if (m != moduleBase) return;
 
             bool wasOurs = false;
@@ -85,19 +102,24 @@ namespace FishingAutoCatch
                 wasOurs = true;
             var curB = new byte[HookStub.SuccessPatchLength];
             bool bOurs = originalB != null && ReadAt(hProcess, targetB, curB) && ArraysEqual(curB, HookStub.SuccessPatch);
-            if (!wasOurs && !bOurs) return;
+            var curC = new byte[HookStub.CastPatchLength];
+            bool cOurs = originalC != null && ReadAt(hProcess, targetC, curC) && IsOurPatch(curC, stubBase);
+            var curD = new byte[HookStub.BagPatchLength];
+            bool dOurs = originalD != null && ReadAt(hProcess, targetD, curD) && IsOurPatch(curD, stubBase);
+            if (!wasOurs && !bOurs && !cOurs && !dOurs) return;
 
-            if (wasOurs && originalA != null)
-                ProtectWriteVerify(hProcess, targetA, originalA);
-            if (bOurs && originalB != null)
-                ProtectWriteVerify(hProcess, targetB, originalB);
+            if (wasOurs && originalA != null) ProtectWriteVerify(hProcess, targetA, originalA);
+            if (bOurs && originalB != null) ProtectWriteVerify(hProcess, targetB, originalB);
+            if (cOurs && originalC != null) ProtectWriteVerify(hProcess, targetC, originalC);
+            if (dOurs && originalD != null) ProtectWriteVerify(hProcess, targetD, originalD);
             Win32Api.VirtualFreeEx(hProcess, new IntPtr(stubBase), IntPtr.Zero, 0x8000 /*MEM_RELEASE*/);
         }
 
         // ---------------- 还原 ----------------
         public static string Remove(IntPtr hProcess, long moduleBaseNow)
         {
-            if (!PatchState.TryLoad(out var moduleBase, out var stubBase, out var originalA, out var originalB))
+            if (!PatchState.TryLoad(out var moduleBase, out var stubBase,
+                    out var originalA, out var originalB, out var originalC, out var originalD))
                 return "未找到本模块的注入状态文件，无法还原（可能从未注入或文件被删）。";
 
             if (moduleBase != moduleBaseNow)
@@ -105,8 +127,10 @@ namespace FishingAutoCatch
 
             long targetA = moduleBase + HookStub.HookRva;
             long targetB = moduleBase + HookStub.SuccessRva;
+            long targetC = moduleBase + HookStub.CastRva;
+            long targetD = moduleBase + HookStub.BagRva;
 
-            // Hook A：必须是本模块的 detour 才还原
+            // Hook A/C/D：必须是本模块的 detour 才还原
             if (originalA != null)
             {
                 var curA = new byte[HookStub.PatchLength];
@@ -128,15 +152,35 @@ namespace FishingAutoCatch
                     return "还原 Hook B 失败或校验不一致。";
             }
 
+            if (originalC != null)
+            {
+                var curC = new byte[HookStub.CastPatchLength];
+                if (!ReadAt(hProcess, targetC, curC)) return "读取 Hook 点 C 失败。";
+                if (!IsOurPatch(curC, stubBase))
+                    return "Hook 点 C 当前内容不是本模块的 patch，跳过还原（可能已被其他工具修改）。";
+                if (!ProtectWriteVerify(hProcess, targetC, originalC))
+                    return "还原 Hook C 失败或校验不一致。";
+            }
+
+            if (originalD != null)
+            {
+                var curD = new byte[HookStub.BagPatchLength];
+                if (!ReadAt(hProcess, targetD, curD)) return "读取 Hook 点 D 失败。";
+                if (!IsOurPatch(curD, stubBase))
+                    return "Hook 点 D 当前内容不是本模块的 patch，跳过还原（可能已被其他工具修改）。";
+                if (!ProtectWriteVerify(hProcess, targetD, originalD))
+                    return "还原 Hook D 失败或校验不一致。";
+            }
+
             Win32Api.VirtualFreeEx(hProcess, new IntPtr(stubBase), IntPtr.Zero, 0x8000 /*MEM_RELEASE*/);
-            return "已还原两个 Hook 点的原始代码并释放 stub 内存。";
+            return "已还原四个 Hook 点的原始代码并释放 stub 内存。";
         }
 
         // ---------------- 状态读取 / F8 切换 ----------------
         /// <summary>读取游戏内 gEnabled 开关，返回 1=开启 0=关闭，-1=未注入。</summary>
         public static int ReadEnabledState(IntPtr hProcess)
         {
-            if (!PatchState.TryLoad(out _, out var stubBase, out _, out _)) return -1;
+            if (!PatchState.TryLoad(out _, out var stubBase, out _, out _, out _, out _)) return -1;
             var buf = new byte[1];
             if (!ReadAt(hProcess, stubBase + HookStub.FlagEnabledOffset, buf)) return -1;
             return buf[0];
@@ -145,7 +189,7 @@ namespace FishingAutoCatch
         /// <summary>加载器侧 F8 切换：读 gEnabled → 翻转 → 写回。返回新状态（1/0），失败返回 -1。</summary>
         public static int ToggleEnabled(IntPtr hProcess)
         {
-            if (!PatchState.TryLoad(out _, out var stubBase, out _, out _)) return -1;
+            if (!PatchState.TryLoad(out _, out var stubBase, out _, out _, out _, out _)) return -1;
             long addr = stubBase + HookStub.FlagEnabledOffset;
             var buf = new byte[1];
             if (!ReadAt(hProcess, addr, buf)) return -1;
@@ -154,10 +198,10 @@ namespace FishingAutoCatch
             return buf[0];
         }
 
-        /// <summary>健康检查：两个 Hook 点是否在位、Hook B 与开关状态是否一致、开关状态与自动判定累计次数。</summary>
+        /// <summary>健康检查：四个 Hook 点是否在位、Hook B 与开关状态是否一致、开关状态与两条计数。</summary>
         public static string Verify(IntPtr hProcess, long moduleBase)
         {
-            if (!PatchState.TryLoad(out var m, out var stubBase, out _, out var originalB))
+            if (!PatchState.TryLoad(out var m, out var stubBase, out _, out var originalB, out _, out _))
                 return "状态文件缺失：尚未注入过本模块。";
             if (m != moduleBase)
                 return "模块基址与注入时不符：游戏可能已重启，需重新注入。";
@@ -168,10 +212,12 @@ namespace FishingAutoCatch
             if (!IsOurPatch(curA, stubBase))
                 return "Hook 点 A 字节与记录不符：patch 已被覆盖（需重新注入）。";
 
-            var st = new byte[5];
+            var st = new byte[10];
             if (!ReadAt(hProcess, stubBase + HookStub.FlagEnabledOffset, st)) return "读取 stub 状态失败。";
             int enabled = st[0];
             int hits = BitConverter.ToInt32(st, 1);
+            int bagFull = st[5];
+            int fishCount = BitConverter.ToInt32(st, 6);
 
             // Hook B 必须与 gEnabled 一致：开启→NOP（跳过成功检查），关闭→原始 je（等待时间线播完）
             var curB = new byte[HookStub.SuccessPatchLength];
@@ -182,7 +228,8 @@ namespace FishingAutoCatch
             if (!bMatch)
                 return $"Hook B 与开关状态不一致（当前开关={enabled}）。请用监控窗口按 F8 同步或重新注入。";
 
-            return $"Hook A/B 均在位且与开关一致。开关={enabled}（1=开），自动判定累计触发 {hits} 次。";
+            return $"Hook A/B/C/D 均在位且与开关一致。开关={enabled}（1=开），" +
+                   $"自动判定累计触发 {hits} 次，本次已钓 {fishCount} 条，背包满={bagFull}。";
         }
 
         /// <summary>
@@ -192,7 +239,7 @@ namespace FishingAutoCatch
         /// </summary>
         public static string SyncHookB(IntPtr hProcess, long moduleBase, bool enabled)
         {
-            if (!PatchState.TryLoad(out var m, out _, out _, out var originalB))
+            if (!PatchState.TryLoad(out var m, out _, out _, out var originalB, out _, out _))
                 return "状态文件缺失：尚未注入，无需同步。";
             if (m != moduleBase)
                 return "模块基址与注入时不符（游戏可能已重启），拒绝修改 Hook B。";
@@ -211,21 +258,31 @@ namespace FishingAutoCatch
                            : "Hook B → 原版 je（恢复等待时间线播完，手动玩法生效）";
         }
 
-        /// <summary>供监控模式读取实时开关与命中计数；模块基址与记录不符（游戏重启）时返回 null。</summary>
-        public static (int enabled, int hits)? ReadLiveState(IntPtr hProcess, long moduleBase)
+        /// <summary>供监控模式读取实时开关与计数；模块基址与记录不符（游戏重启）时返回 null。</summary>
+        public static (int enabled, int hits, int bagFull, int fishCount)? ReadLiveState(IntPtr hProcess, long moduleBase)
         {
-            if (!PatchState.TryLoad(out var m, out var stubBase, out _, out _)) return null;
+            if (!PatchState.TryLoad(out var m, out var stubBase, out _, out _, out _, out _)) return null;
             if (m != moduleBase) return null;
-            var st = new byte[5];
+            var st = new byte[10];
             if (!ReadAt(hProcess, stubBase + HookStub.FlagEnabledOffset, st)) return null;
-            return (st[0], BitConverter.ToInt32(st, 1));
+            return (st[0], BitConverter.ToInt32(st, 1), st[5], BitConverter.ToInt32(st, 6));
         }
 
         // ---------------- 内部工具 ----------------
-        /// <summary>校验"入口 detour"15 字节是否为指向 stubBase 的 jmp。</summary>
+        /// <summary>构造入口 detour：`FF 25 00000000 <stubBase 8字节>` + 剩余 NOP 填充到 patch 长度。</summary>
+        private static byte[] BuildDetourPatch(long stubBase, int patchLen)
+        {
+            var patch = new byte[patchLen];
+            Array.Copy(Signature, patch, Signature.Length);
+            for (int i = 0; i < 8; i++) patch[6 + i] = (byte)((ulong)stubBase >> (8 * i));
+            for (int i = 14; i < patchLen; i++) patch[i] = 0x90; // NOP 填充
+            return patch;
+        }
+
+        /// <summary>校验"入口 detour"是否为指向 stubBase 的 jmp（比较前 14 字节 + stubBase 地址）。</summary>
         private static bool IsOurPatch(byte[] current, long stubBase)
         {
-            if (current.Length != HookStub.PatchLength) return false;
+            if (current.Length < 14) return false;
             for (int i = 0; i < Signature.Length; i++)
                 if (current[i] != Signature[i]) return false;
             for (int i = 0; i < 8; i++)

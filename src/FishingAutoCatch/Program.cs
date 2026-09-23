@@ -7,9 +7,9 @@ using System.Threading;
 namespace FishingAutoCatch
 {
     /// <summary>
-    /// 钓鱼自动收杆（FishingAutoCatch）启动器 / 注入器。
+    /// 自动钓鱼（FishingAutoCatch）启动器 / 注入器。
     /// 用法：
-    ///   FishingAutoCatch                 监控模式（默认）：等待/自动注入游戏、实时显示 F8 开关与触发次数、游戏重启自动重注
+    ///   FishingAutoCatch                 监控模式（默认）：等待/自动注入游戏、实时显示 F8 开关与自动循环状态、游戏重启自动重注
     ///   FishingAutoCatch --once          一次性注入（若游戏未启动则等待最多 30 秒）
     ///   FishingAutoCatch --status        查询开关状态
     ///   FishingAutoCatch --verify        健康检查（Hook 是否在位 + 触发计数）
@@ -19,7 +19,7 @@ namespace FishingAutoCatch
     internal static class Program
     {
         /// <summary>与 version.txt 同步维护。</summary>
-        public const string Version = "0.3.1";
+        public const string Version = "1.0.0";
 
         private static int Main(string[] args)
         {
@@ -106,8 +106,8 @@ namespace FishingAutoCatch
 
                         case "--status":
                             int state = Injector.ReadEnabledState(handle.Handle);
-                            Console.WriteLine(state == 1 ? "钓鱼自动收杆：开启（保持监控窗口运行，任意场景按 F8 切换，开启 880Hz/关闭 440Hz 提示音）"
-                                    : state == 0 ? "钓鱼自动收杆：关闭（保持监控窗口运行，任意场景按 F8 切换）"
+                            Console.WriteLine(state == 1 ? "自动钓鱼：开启（保持监控窗口运行，任意场景按 F8 切换，开启 880Hz/关闭 440Hz 提示音）"
+                                    : state == 0 ? "自动钓鱼：关闭（保持监控窗口运行，任意场景按 F8 切换）"
                                     : "未注入或状态文件缺失。");
                             return 0;
 
@@ -116,7 +116,7 @@ namespace FishingAutoCatch
                             return 0;
 
                         case "--once":
-                            Console.WriteLine("正在为目标进程注入钓鱼自动收杆 Hook……");
+                            Console.WriteLine("正在为目标进程注入自动钓鱼 Hook（四 Hook：节奏判定/成功检查/续竿/背包满）……");
                             Console.WriteLine("  进程     : village.exe (PID " + process.Id + ")");
                             Console.WriteLine("  模块基址 : 0x" + moduleBase.ToString("X"));
                             Console.WriteLine(Injector.Install(handle.Handle, moduleBase));
@@ -149,15 +149,17 @@ namespace FishingAutoCatch
 
         private static void PrintUsage()
         {
-            Console.WriteLine("钓鱼自动收杆 (FishingAutoCatch) v" + Version);
-            Console.WriteLine("用于《Village in the Shade》：跳过「鱼上钩拉线节奏小游戏」，咬钩后自动判定成功；");
-            Console.WriteLine("保留甩竿→等咬钩→收杆流程，鱼获走正规成功流程，不修改品质/数量。");
+            Console.WriteLine("自动钓鱼 (FishingAutoCatch) v" + Version);
+            Console.WriteLine("用于《Village in the Shade》：F8 开启后在水边甩竿即进入自动循环——");
+            Console.WriteLine("等咬钩→自动判定成功→收杆入包→自动再甩竿；F8 关闭则完全原版。");
+            Console.WriteLine("停止：按游戏内收杆键（Enter/手柄 A）立即走原版手动收杆路径；");
+            Console.WriteLine("背包满自动停下并提示，清包后自动恢复循环；不修改鱼品质/数量。");
             Console.WriteLine();
             Console.WriteLine("用法（不带参数运行 = 监控模式，推荐）：");
-            Console.WriteLine("  FishingAutoCatch             监控模式：等待游戏启动→自动注入→实时显示 F8 开关/触发次数→游戏重启自动重注");
+            Console.WriteLine("  FishingAutoCatch             监控模式：等待游戏启动→自动注入→实时显示 F8 开关/已钓条数/背包满→游戏重启自动重注");
             Console.WriteLine("  FishingAutoCatch --once     一次性注入（等待游戏最多 30 秒）");
             Console.WriteLine("  FishingAutoCatch --status   查询当前开关状态");
-            Console.WriteLine("  FishingAutoCatch --verify   健康检查（Hook 是否在位、累计触发次数）");
+            Console.WriteLine("  FishingAutoCatch --verify   健康检查（四个 Hook 是否在位、触发次数、已钓条数）");
             Console.WriteLine("  FishingAutoCatch --remove   还原被 Hook 的原始代码");
             Console.WriteLine("  FishingAutoCatch --dump-stub [路径]  输出 stub 机器码用于反汇编验证");
             Console.WriteLine();
